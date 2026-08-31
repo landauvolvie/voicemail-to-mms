@@ -170,7 +170,7 @@ async function callVoipMs(env, method, params = {}) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const form = new FormData();
+      const form = new URLSearchParams();
       form.set("api_username", env.VOIPMS_API_USERNAME);
       form.set("api_password", env.VOIPMS_API_PASSWORD);
       form.set("method", method);
@@ -179,7 +179,14 @@ async function callVoipMs(env, method, params = {}) {
         if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
       }
 
-      const response = await fetch(VOIPMS_ENDPOINT, { method: "POST", body: form });
+      const response = await fetch(VOIPMS_ENDPOINT, {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        body: form.toString(),
+      });
       const responseText = await response.text();
       const data = parseVoipMsResponse(responseText, response.status);
 
