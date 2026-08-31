@@ -152,7 +152,7 @@ async function sendMms(env, message, audioBytes, attachment) {
     did: normalizePhone(env.VOIPMS_DID),
     dst: normalizePhone(env.MMS_DESTINATION),
     message,
-    media1: dataUrl,
+    media2: dataUrl,
   });
 }
 
