@@ -10,7 +10,7 @@ import {
 } from "../src/core.js";
 
 test("normalizes NANP numbers", () => {
-  assert.equal(normalizePhone("+1 (845) 324-1813"), "2035550182");
+  assert.equal(normalizePhone("+1 (203) 555-0182"), "2035550182");
   assert.equal(formatPhone("2035550182"), "203-555-0182");
 });
 
@@ -32,7 +32,7 @@ test("extracts caller name and number from a labeled line", () => {
 
 test("excludes own DID and MMS destination when finding caller", () => {
   const result = extractCallerIdentity(
-    "DID 860-506-0971 destination 203-555-0182 caller 914-555-0100",
+    "DID 212-555-0199 destination 203-555-0182 caller 914-555-0100",
     "2125550199",
     "2035550182",
   );
