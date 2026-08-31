@@ -7,6 +7,7 @@ import {
   extensionForAttachment,
   extractCallerIdentity,
   extractVoicemailDate,
+  formatDate,
   findAudioAttachment,
   isAllowedSender,
   mimeFromAttachment,
@@ -17,19 +18,31 @@ import {
 
 const VOIPMS_ENDPOINT = "https://voip.ms/api/v1/rest.php";
 const MAX_EMAIL_BYTES = 12 * 1024 * 1024;
+const REQUIRED_BINDINGS = ["VOIPMS_API_USERNAME", "VOIPMS_API_PASSWORD", "VOIPMS_DID", "MMS_DESTINATION"];
 
 export default {
   async email(message, env) {
-    requireEnv(env, ["VOIPMS_API_USERNAME", "VOIPMS_API_PASSWORD", "VOIPMS_DID", "MMS_DESTINATION"]);
+    const eventId = await makeEventId(message);
+    logEvent("email_received", eventId, {
+      sender: safeSender(message.from),
+      recipient: String(message.to || ""),
+      rawSize: Number(message.rawSize || 0),
+    });
+
+    const missing = missingBindings(env);
+    if (missing.length) {
+      logEvent("configuration_error", eventId, { missingBindings: missing }, "error");
+      throw new Error(`Missing Worker secret/variable(s): ${missing.join(", ")}`);
+    }
 
     if (!isAllowedSender(message.from, env.ALLOWED_SENDER_DOMAINS)) {
-      console.warn("Rejected email from unauthorized sender domain.");
+      logEvent("email_rejected", eventId, { reason: "unauthorized_sender", sender: safeSender(message.from) }, "warn");
       message.setReject("Unauthorized voicemail sender");
       return;
     }
 
     if (message.rawSize > MAX_EMAIL_BYTES) {
-      console.warn(`Rejected oversized email (${message.rawSize} bytes).`);
+      logEvent("email_rejected", eventId, { reason: "oversized_email", rawSize: message.rawSize }, "warn");
       message.setReject("Voicemail email too large");
       return;
     }
@@ -41,21 +54,38 @@ export default {
     const voicemailDate = extractVoicemailDate(textSource, parsed.date || message.headers.get("date"));
     const notificationText = buildNotificationText(identity, voicemailDate, env.TIME_ZONE, env.CONTACTS_JSON);
     const audio = findAudioAttachment(parsed.attachments || []);
-    const eventId = await makeEventId(message, raw);
+
+    logEvent("email_parsed", eventId, {
+      subject: String(parsed.subject || "").slice(0, 240),
+      callerNumber: identity.number || "",
+      callerName: identity.name || "",
+      voicemailTime: formatDate(voicemailDate, env.TIME_ZONE),
+      voicemailTimeIso: voicemailDate.toISOString(),
+      attachmentCount: (parsed.attachments || []).length,
+      audioFound: Boolean(audio),
+    });
 
     if (await isAlreadyProcessed(env, eventId)) {
-      console.log(`Voicemail ${eventId}: duplicate email ignored.`);
+      logEvent("duplicate_ignored", eventId);
       return;
     }
 
     if (!audio) {
-      console.warn(`Voicemail ${eventId}: no audio attachment found.`);
-      await sendFallbackSms(env, buildFallbackText(notificationText, "missing_audio"));
+      logEvent("fallback_attempt", eventId, { reason: "missing_audio" }, "warn");
+      const result = await sendFallbackSms(env, buildFallbackText(notificationText, "missing_audio"));
+      logEvent("fallback_success", eventId, { reason: "missing_audio", messageId: result.sms || "" });
       await markProcessedIfConfigured(env, eventId, "sms_missing_audio");
       return;
     }
 
     const audioBytes = toUint8Array(audio.content);
+    const audioDetails = {
+      audioType: mimeFromAttachment(audio),
+      audioSize: audioBytes.byteLength,
+      audioFilename: String(audio.filename || "").slice(0, 160),
+    };
+    logEvent("audio_found", eventId, audioDetails);
+
     const archive = await archiveVoicemailIfConfigured(env, {
       eventId,
       audioBytes,
@@ -69,23 +99,27 @@ export default {
       const fallback = link
         ? truncateForSms(`${notificationText}. Listen: ${link}`, 160)
         : buildFallbackText(notificationText, "too_large");
-      console.warn(`Voicemail ${eventId}: audio too large for MMS (${audioBytes.byteLength} bytes).`);
-      await sendFallbackSms(env, fallback);
+      logEvent("fallback_attempt", eventId, { reason: "too_large", ...audioDetails }, "warn");
+      const result = await sendFallbackSms(env, fallback);
+      logEvent("fallback_success", eventId, { reason: "too_large", messageId: result.sms || "" });
       await markProcessedIfConfigured(env, eventId, "sms_too_large");
       return;
     }
 
     try {
+      logEvent("mms_attempt", eventId, audioDetails);
       const result = await sendMms(env, notificationText, audioBytes, audio);
-      console.log(`Voicemail ${eventId}: MMS sent successfully. ID: ${result.mms || result.sms || "unknown"}`);
+      logEvent("mms_success", eventId, { messageId: result.mms || result.sms || "", status: result.status || "success" });
       await markProcessedIfConfigured(env, eventId, "mms_sent");
     } catch (error) {
-      console.error(`Voicemail ${eventId}: MMS failed:`, safeError(error));
+      logEvent("mms_failure", eventId, { error: safeError(error) }, "error");
       const link = archive?.url;
       const fallback = link
         ? truncateForSms(`${notificationText}. Listen: ${link}`, 160)
         : buildFallbackText(notificationText, "mms_failed");
-      await sendFallbackSms(env, fallback);
+      logEvent("fallback_attempt", eventId, { reason: "mms_failed" }, "warn");
+      const result = await sendFallbackSms(env, fallback);
+      logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "" });
       await markProcessedIfConfigured(env, eventId, "sms_fallback");
     }
   },
@@ -98,6 +132,8 @@ export default {
         service: "voicemail-to-mms",
         archiveConfigured: Boolean(env.VOICEMAIL_BUCKET),
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
+        requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
+        maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
       });
     }
 
@@ -121,17 +157,11 @@ async function sendMms(env, message, audioBytes, attachment) {
 }
 
 async function sendFallbackSms(env, message) {
-  try {
-    const result = await callVoipMs(env, "sendSMS", {
-      did: normalizePhone(env.VOIPMS_DID),
-      dst: normalizePhone(env.MMS_DESTINATION),
-      message: truncateForSms(message, 160),
-    });
-    console.log(`Fallback SMS sent. ID: ${result.sms || "unknown"}`);
-  } catch (error) {
-    console.error("Fallback SMS failed:", safeError(error));
-    throw error;
-  }
+  return callVoipMs(env, "sendSMS", {
+    did: normalizePhone(env.VOIPMS_DID),
+    dst: normalizePhone(env.MMS_DESTINATION),
+    message: truncateForSms(message, 160),
+  });
 }
 
 async function callVoipMs(env, method, params = {}) {
@@ -279,9 +309,9 @@ async function markProcessedIfConfigured(env, eventId, status) {
   });
 }
 
-async function makeEventId(message, raw) {
+async function makeEventId(message) {
   const messageId = message.headers.get("message-id");
-  const source = messageId || `${message.from}|${message.to}|${message.headers.get("date") || ""}|${raw.byteLength}`;
+  const source = messageId || `${message.from}|${message.to}|${message.headers.get("date") || ""}|${message.rawSize || 0}`;
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
   return [...new Uint8Array(hash)].slice(0, 10).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -320,11 +350,29 @@ function truncateForSms(value, max) {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
-function requireEnv(env, names) {
-  const missing = names.filter((name) => !env[name]);
-  if (missing.length) throw new Error(`Missing Worker secret/variable(s): ${missing.join(", ")}`);
+function missingBindings(env) {
+  return REQUIRED_BINDINGS.filter((name) => !env[name]);
+}
+
+function safeSender(value) {
+  const match = String(value || "").match(/<?([^<>\s]+@[^<>\s]+)>?/);
+  return match?.[1] || String(value || "");
+}
+
+function logEvent(stage, eventId, details = {}, level = "log") {
+  const payload = {
+    service: "voicemail-to-mms",
+    stage,
+    eventId,
+    timestamp: new Date().toISOString(),
+    ...details,
+  };
+  const method = level === "error" ? "error" : level === "warn" ? "warn" : "log";
+  console[method](JSON.stringify(payload));
 }
 
 function safeError(error) {
-  return String(error?.message || error || "unknown error").replace(/api_password=[^&\s]+/gi, "api_password=[redacted]");
+  return String(error?.message || error || "unknown error")
+    .replace(/api_password=[^&\s]+/gi, "api_password=[redacted]")
+    .replace(/api_username=[^&\s]+/gi, "api_username=[redacted]");
 }

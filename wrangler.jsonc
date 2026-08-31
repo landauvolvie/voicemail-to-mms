@@ -2,5 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "voicemail-to-mms",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-31"
+  "compatibility_date": "2026-08-31",
+  "keep_vars": true,
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
 }

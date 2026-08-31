@@ -28,6 +28,16 @@ export function extractCallerIdentity(text, ownDid, destination) {
   const own = normalizePhone(ownDid);
   const dst = normalizePhone(destination);
   const excluded = new Set([own, dst].filter(Boolean));
+
+  // Real VoIP.ms subjects use: New voicemail ... from "Caller Name" <number>.
+  const subjectIdentity = clean.match(/\bfrom\s+(?:"([^"]*)"\s*)?<\s*([^>]+)\s*>/i);
+  if (subjectIdentity) {
+    const number = normalizePhone(subjectIdentity[2]);
+    if (number.length === 10 && !excluded.has(number)) {
+      return { number, name: sanitizeName(subjectIdentity[1] || "") };
+    }
+  }
+
   const lines = clean.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
   const labeled = lines.filter((line) => /\b(caller(?:\s*id)?|from|calling party|phone)\b\s*[:\-]/i.test(line));
