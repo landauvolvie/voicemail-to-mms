@@ -17,6 +17,7 @@ import {
 } from "./core.js";
 
 const VOIPMS_ENDPOINT = "https://voip.ms/api/v1/rest.php";
+const VOIPMS_3CX_ENDPOINT = "https://voip.ms/api/3cx/msg";
 const MAX_EMAIL_BYTES = 12 * 1024 * 1024;
 const REQUIRED_BINDINGS = ["VOIPMS_API_USERNAME", "VOIPMS_API_PASSWORD", "VOIPMS_DID", "MMS_DESTINATION"];
 
@@ -157,11 +158,57 @@ async function sendMms(env, message, audioBytes, attachment) {
 }
 
 async function sendFallbackSms(env, message) {
+  const text = truncateForSms(message, 160);
+  if (env.VOIPMS_BEARER_TOKEN) {
+    return callVoipMsBearer(env, {
+      from: toE164(env.VOIPMS_DID),
+      to: toE164(env.MMS_DESTINATION),
+      text,
+    });
+  }
   return callVoipMs(env, "sendSMS", {
     did: normalizePhone(env.VOIPMS_DID),
     dst: normalizePhone(env.MMS_DESTINATION),
-    message: truncateForSms(message, 160),
+    message: text,
   });
+}
+
+async function callVoipMsBearer(env, payload) {
+  const response = await fetch(VOIPMS_3CX_ENDPOINT, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${env.VOIPMS_BEARER_TOKEN}`,
+      "content-type": "application/json",
+      "user-agent": "3CXPhoneSystem",
+      "x-client-name": "voicemail-to-mms",
+    },
+    body: JSON.stringify(payload),
+  });
+  const responseText = await response.text();
+  let data = {};
+  try {
+    data = responseText ? JSON.parse(responseText) : {};
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok) {
+    if (response.status === 403 && /<html|attention required/i.test(responseText)) {
+      throw new Error(describeVoipMsEdgeRejection(response, responseText, "3CX message API"));
+    }
+    const status = String(data.status || data.error || data.message || `http_${response.status}`).slice(0, 240);
+    throw new Error(`VoIP.ms bearer message API failed: ${status}`);
+  }
+
+  const messageId = data.id || data.message_id || data.messageId || data.sms || data.mms || data.data?.id || "";
+  return { ...data, status: data.status || "success", sms: messageId };
+}
+
+function toE164(value) {
+  const digits = normalizePhone(value);
+  if (digits.length === 10) return `+1${digits}`;
+  return digits.startsWith("1") ? `+${digits}` : `+${digits}`;
 }
 
 async function callVoipMs(env, method, params = {}) {
