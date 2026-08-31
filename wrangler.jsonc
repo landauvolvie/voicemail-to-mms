@@ -9,5 +9,14 @@
       "enabled": true,
       "invocation_logs": true
     }
-  }
+  },
+  "vars": {
+    "PUBLIC_BASE_URL": "https://voicemail-to-mms.landauvolvie.workers.dev"
+  },
+  "r2_buckets": [
+    {
+      "binding": "VOICEMAIL_BUCKET",
+      "bucket_name": "voicemail-to-mms-audio"
+    }
+  ]
 }
