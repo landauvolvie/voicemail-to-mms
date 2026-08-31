@@ -109,7 +109,7 @@ export default {
 
     try {
       logEvent("mms_attempt", eventId, audioDetails);
-      const result = await sendMms(env, notificationText, audioBytes, audio);
+      const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
       logEvent("mms_success", eventId, { messageId: result.mms || result.sms || "", status: result.status || "success" });
       await markProcessedIfConfigured(env, eventId, "mms_sent");
     } catch (error) {
@@ -146,7 +146,18 @@ export default {
   },
 };
 
-async function sendMms(env, message, audioBytes, attachment) {
+async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
+  if (env.VOIPMS_BEARER_TOKEN && mediaUrl) {
+    const result = await callVoipMsBearer(env, {
+      from: toE164(env.VOIPMS_DID),
+      to: toE164(env.MMS_DESTINATION),
+      subject: "Voicemail",
+      text: truncateForSms(message, 160),
+      media_urls: [mediaUrl],
+    });
+    return { ...result, mms: result.mms || result.sms || result.id || result.message_id || "" };
+  }
+
   const mimeType = mimeFromAttachment(attachment);
   const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
   return callVoipMs(env, "sendMMS", {
