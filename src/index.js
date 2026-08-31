@@ -182,12 +182,19 @@ async function callVoipMs(env, method, params = {}) {
       const response = await fetch(VOIPMS_ENDPOINT, {
         method: "POST",
         headers: {
-          accept: "application/json",
+          accept: "application/json, text/plain, */*",
+          "accept-language": "en-US,en;q=0.9",
+          "cache-control": "no-cache",
           "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "user-agent": "Mozilla/5.0 (compatible; voicemail-to-mms/1.0; +https://github.com/landauvolvie/voicemail-to-mms)",
+          "x-client-name": "voicemail-to-mms",
         },
         body: form.toString(),
       });
       const responseText = await response.text();
+      if (response.status === 403) {
+        throw new Error(describeVoipMsEdgeRejection(response, responseText, method));
+      }
       const data = parseVoipMsResponse(responseText, response.status);
 
       if (response.ok && data.status === "success") return data;
@@ -206,6 +213,13 @@ async function callVoipMs(env, method, params = {}) {
   }
 
   throw lastError || new Error(`VoIP.ms ${method} failed`);
+}
+
+function describeVoipMsEdgeRejection(response, text, method) {
+  const title = String(text).match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim() || "unknown";
+  const rayId = response.headers.get("cf-ray") || "unavailable";
+  const server = response.headers.get("server") || "unknown";
+  return `VoIP.ms ${method} rejected at provider edge (HTTP 403; title=${title}; server=${server}; ray=${rayId})`;
 }
 
 function parseVoipMsResponse(text, httpStatus) {
