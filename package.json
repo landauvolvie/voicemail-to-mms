@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "node --check src/index.js && node --check src/core.js",
+    "test": "node --test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
