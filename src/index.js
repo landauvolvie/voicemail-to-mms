@@ -72,7 +72,7 @@ export default {
     }
 
     if (!audio) {
-      logEvent("fallback_attempt", eventId, { reason: "missing_audio" }, "warn");
+      logEvent("fallback_attempt", eventId, { reason: "missing_audio", transport: "rest_get" }, "warn");
       const result = await sendFallbackSms(env, buildFallbackText(notificationText, "missing_audio"));
       logEvent("fallback_success", eventId, { reason: "missing_audio", messageId: result.sms || "" });
       await markProcessedIfConfigured(env, eventId, "sms_missing_audio");
@@ -100,7 +100,7 @@ export default {
       const fallback = link
         ? truncateForSms(`${notificationText}. Listen: ${link}`, 160)
         : buildFallbackText(notificationText, "too_large");
-      logEvent("fallback_attempt", eventId, { reason: "too_large", ...audioDetails }, "warn");
+      logEvent("fallback_attempt", eventId, { reason: "too_large", transport: "rest_get", ...audioDetails }, "warn");
       const result = await sendFallbackSms(env, fallback);
       logEvent("fallback_success", eventId, { reason: "too_large", messageId: result.sms || "" });
       await markProcessedIfConfigured(env, eventId, "sms_too_large");
@@ -108,9 +108,17 @@ export default {
     }
 
     try {
-      logEvent("mms_attempt", eventId, audioDetails);
+      logEvent("mms_attempt", eventId, {
+        ...audioDetails,
+        transport: archive?.url ? "rest_get_media_url" : "post_or_bearer_fallback",
+        mediaUrlConfigured: Boolean(archive?.url),
+      });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
-      logEvent("mms_success", eventId, { messageId: result.mms || result.sms || "", status: result.status || "success" });
+      logEvent("mms_success", eventId, {
+        messageId: result.mms || result.sms || "",
+        status: result.status || "success",
+        transport: result.transport || "unknown",
+      });
       await markProcessedIfConfigured(env, eventId, "mms_sent");
     } catch (error) {
       logEvent("mms_failure", eventId, { error: safeError(error) }, "error");
@@ -118,9 +126,9 @@ export default {
       const fallback = link
         ? truncateForSms(`${notificationText}. Listen: ${link}`, 160)
         : buildFallbackText(notificationText, "mms_failed");
-      logEvent("fallback_attempt", eventId, { reason: "mms_failed" }, "warn");
+      logEvent("fallback_attempt", eventId, { reason: "mms_failed", transport: "rest_get" }, "warn");
       const result = await sendFallbackSms(env, fallback);
-      logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "" });
+      logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "", transport: result.transport || "unknown" });
       await markProcessedIfConfigured(env, eventId, "sms_fallback");
     }
   },
@@ -135,6 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
+        outboundTransport: "VoIP.ms REST GET primary; R2 signed media URL for MMS",
       });
     }
 
@@ -147,41 +156,73 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  if (env.VOIPMS_BEARER_TOKEN && mediaUrl) {
-    const result = await callVoipMsBearer(env, {
-      from: toE164(env.VOIPMS_DID),
-      to: toE164(env.MMS_DESTINATION),
-      subject: "Voicemail",
-      text: truncateForSms(message, 160),
-      media_urls: [mediaUrl],
+  // Primary path: use VoIP.ms's documented REST GET support and give VoIP.ms
+  // the signed R2 URL in media1. The recipient still receives an MMS with the
+  // MP3 attached; the URL is only used server-to-server by VoIP.ms to fetch it.
+  if (mediaUrl) {
+    const result = await callVoipMsGet(env, "sendMMS", {
+      did: normalizePhone(env.VOIPMS_DID),
+      dst: normalizePhone(env.MMS_DESTINATION),
+      message,
+      media1: mediaUrl,
     });
-    return { ...result, mms: result.mms || result.sms || result.id || result.message_id || "" };
+    return { ...result, transport: "rest_get_media_url" };
+  }
+
+  // If R2/private media URLs are unavailable, keep the prior transports as
+  // fallbacks. They are not the preferred production path because VoIP.ms's
+  // edge was observed blocking POST traffic from Cloudflare Workers.
+  if (env.VOIPMS_BEARER_TOKEN) {
+    try {
+      const result = await callVoipMsBearer(env, {
+        from: toE164(env.VOIPMS_DID),
+        to: toE164(env.MMS_DESTINATION),
+        subject: "Voicemail",
+        text: truncateForSms(message, 160),
+      });
+      return { ...result, mms: result.mms || result.sms || result.id || result.message_id || "", transport: "bearer_post_no_media" };
+    } catch (error) {
+      console.warn(`Bearer fallback failed: ${safeError(error)}`);
+    }
   }
 
   const mimeType = mimeFromAttachment(attachment);
   const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
-  return callVoipMs(env, "sendMMS", {
+  const result = await callVoipMsPost(env, "sendMMS", {
     did: normalizePhone(env.VOIPMS_DID),
     dst: normalizePhone(env.MMS_DESTINATION),
     message,
     media2: dataUrl,
   });
+  return { ...result, transport: "rest_post_base64" };
 }
 
 async function sendFallbackSms(env, message) {
   const text = truncateForSms(message, 160);
-  if (env.VOIPMS_BEARER_TOKEN) {
-    return callVoipMsBearer(env, {
-      from: toE164(env.VOIPMS_DID),
-      to: toE164(env.MMS_DESTINATION),
-      text,
+
+  // Test/use GET first as a separate path around the provider edge rule that
+  // has been rejecting POST requests from Cloudflare Workers.
+  try {
+    const result = await callVoipMsGet(env, "sendSMS", {
+      did: normalizePhone(env.VOIPMS_DID),
+      dst: normalizePhone(env.MMS_DESTINATION),
+      message: text,
     });
+    return { ...result, transport: "rest_get" };
+  } catch (getError) {
+    if (!env.VOIPMS_BEARER_TOKEN) throw getError;
+
+    try {
+      const result = await callVoipMsBearer(env, {
+        from: toE164(env.VOIPMS_DID),
+        to: toE164(env.MMS_DESTINATION),
+        text,
+      });
+      return { ...result, transport: "bearer_post" };
+    } catch (bearerError) {
+      throw new Error(`VoIP.ms GET failed: ${safeError(getError)}; bearer fallback failed: ${safeError(bearerError)}`);
+    }
   }
-  return callVoipMs(env, "sendSMS", {
-    did: normalizePhone(env.VOIPMS_DID),
-    dst: normalizePhone(env.MMS_DESTINATION),
-    message: text,
-  });
 }
 
 async function callVoipMsBearer(env, payload) {
@@ -222,20 +263,58 @@ function toE164(value) {
   return digits.startsWith("1") ? `+${digits}` : `+${digits}`;
 }
 
-async function callVoipMs(env, method, params = {}) {
+async function callVoipMsGet(env, method, params = {}) {
   const maxAttempts = 3;
   let lastError;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const form = new URLSearchParams();
-      form.set("api_username", env.VOIPMS_API_USERNAME);
-      form.set("api_password", env.VOIPMS_API_PASSWORD);
-      form.set("method", method);
-      form.set("content_type", "json");
-      for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
+      const query = buildVoipMsParams(env, method, params);
+      const url = new URL(VOIPMS_ENDPOINT);
+      url.search = query.toString();
+
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        headers: {
+          accept: "application/json, text/plain, */*",
+          "accept-language": "en-US,en;q=0.9",
+          "cache-control": "no-cache",
+          pragma: "no-cache",
+          "user-agent": "Mozilla/5.0 (compatible; voicemail-to-mms/1.0)",
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      const responseText = await response.text();
+      if (response.status === 403) {
+        throw new Error(describeVoipMsEdgeRejection(response, responseText, `${method} GET`));
       }
+      const data = parseVoipMsResponse(responseText, response.status);
+
+      if (response.ok && data.status === "success") return data;
+
+      const status = String(data.status || `http_${response.status}`);
+      if (attempt < maxAttempts && isRetryableVoipStatus(status, response.status)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new Error(`VoIP.ms ${method} GET failed: ${status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableException(error)) break;
+      await sleep(backoffMs(attempt));
+    }
+  }
+
+  throw lastError || new Error(`VoIP.ms ${method} GET failed`);
+}
+
+async function callVoipMsPost(env, method, params = {}) {
+  const maxAttempts = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const form = buildVoipMsParams(env, method, params);
 
       const response = await fetch(VOIPMS_ENDPOINT, {
         method: "POST",
@@ -251,7 +330,7 @@ async function callVoipMs(env, method, params = {}) {
       });
       const responseText = await response.text();
       if (response.status === 403) {
-        throw new Error(describeVoipMsEdgeRejection(response, responseText, method));
+        throw new Error(describeVoipMsEdgeRejection(response, responseText, `${method} POST`));
       }
       const data = parseVoipMsResponse(responseText, response.status);
 
@@ -262,7 +341,7 @@ async function callVoipMs(env, method, params = {}) {
         await sleep(backoffMs(attempt));
         continue;
       }
-      throw new Error(`VoIP.ms ${method} failed: ${status}`);
+      throw new Error(`VoIP.ms ${method} POST failed: ${status}`);
     } catch (error) {
       lastError = error;
       if (attempt >= maxAttempts || !isRetryableException(error)) break;
@@ -270,7 +349,19 @@ async function callVoipMs(env, method, params = {}) {
     }
   }
 
-  throw lastError || new Error(`VoIP.ms ${method} failed`);
+  throw lastError || new Error(`VoIP.ms ${method} POST failed`);
+}
+
+function buildVoipMsParams(env, method, params = {}) {
+  const values = new URLSearchParams();
+  values.set("api_username", env.VOIPMS_API_USERNAME);
+  values.set("api_password", env.VOIPMS_API_PASSWORD);
+  values.set("method", method);
+  values.set("content_type", "json");
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") values.set(key, String(value));
+  }
+  return values;
 }
 
 function describeVoipMsEdgeRejection(response, text, method) {
