@@ -1,23 +1,11 @@
 import worker from "./index.js";
-import { normalizeVoicemailEmailToWav } from "./wav.js";
 
 const VOIPMS_ENDPOINT = "https://voip.ms/api/v1/rest.php";
 const DIAGNOSTIC_PATH = "/diagnostics/voipms-edge";
 
 export default {
   async email(message, env, ctx) {
-    const normalized = await normalizeVoicemailEmailToWav(message);
-    if (normalized.converted) {
-      console.log(JSON.stringify({
-        service: "voicemail-to-mms",
-        stage: "audio_transcoded_to_wav",
-        sourceBytes: normalized.sourceBytes,
-        wavBytes: normalized.wavBytes,
-        sampleRate: normalized.sampleRate,
-        timestamp: new Date().toISOString(),
-      }));
-    }
-    return worker.email(normalized.message, env, ctx);
+    return worker.email(message, env, ctx);
   },
 
   async fetch(request, env, ctx) {
@@ -38,8 +26,6 @@ async function probeVoipMsEdge(request, env, ctx) {
     }, 503);
   }
 
-  // Cache one sanitized probe result for 60 seconds so this read-only endpoint
-  // cannot be used to hammer the provider API.
   const cache = caches.default;
   const cacheKey = new Request(new URL(DIAGNOSTIC_PATH, request.url).toString(), { method: "GET" });
   const cached = await cache.match(cacheKey);
@@ -80,8 +66,6 @@ async function probeVoipMsEdge(request, env, ctx) {
       providerStatus = String(parsed.status || "");
       providerReachable = response.ok && providerStatus === "success";
     } catch {
-      // Intentionally do not return the raw body because provider pages may
-      // contain request details. The sanitized title/Ray ID are enough.
     }
 
     payload = {
