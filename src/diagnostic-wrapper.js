@@ -1,11 +1,23 @@
 import worker from "./index.js";
+import { normalizeVoicemailEmailToWav } from "./wav.js";
 
 const VOIPMS_ENDPOINT = "https://voip.ms/api/v1/rest.php";
 const DIAGNOSTIC_PATH = "/diagnostics/voipms-edge";
 
 export default {
   async email(message, env, ctx) {
-    return worker.email(message, env, ctx);
+    const normalized = await normalizeVoicemailEmailToWav(message);
+    if (normalized.converted) {
+      console.log(JSON.stringify({
+        service: "voicemail-to-mms",
+        stage: "audio_transcoded_to_wav",
+        sourceBytes: normalized.sourceBytes,
+        wavBytes: normalized.wavBytes,
+        sampleRate: normalized.sampleRate,
+        timestamp: new Date().toISOString(),
+      }));
+    }
+    return worker.email(normalized.message, env, ctx);
   },
 
   async fetch(request, env, ctx) {
