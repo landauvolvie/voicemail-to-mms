@@ -110,7 +110,7 @@ export default {
     try {
       logEvent("mms_attempt", eventId, {
         ...audioDetails,
-        transport: "rest_post_multipart_base64",
+        transport: "rest_post_multipart_base64_media2",
         mediaUrlConfigured: Boolean(archive?.url),
       });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
@@ -143,7 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        outboundTransport: "VoIP.ms REST multipart POST base64 primary; R2 media URL fallback",
+        outboundTransport: "VoIP.ms REST multipart POST base64 in media2 primary; R2 media URL fallback",
       });
     }
 
@@ -156,9 +156,9 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  // VoIP.ms accepts base64 MMS media through POST, but their implementation
-  // expects multipart/form-data for larger base64 payloads. Sending the same
-  // payload as application/x-www-form-urlencoded produced a SOAP HTTP 500.
+  // VoIP.ms uses media1 for a remote media URL and media2 for a base64 data
+  // URI. Keep the WAV bytes in media2 so the provider does not accept the MMS
+  // while silently creating a zero-byte media attachment.
   const detectedMimeType = mimeFromAttachment(attachment);
   const mimeType = detectedMimeType === "audio/x-wav" ? "audio/wav" : detectedMimeType;
   const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
@@ -168,9 +168,9 @@ async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
       did: normalizePhone(env.VOIPMS_DID),
       dst: normalizePhone(env.MMS_DESTINATION),
       message,
-      media1: dataUrl,
+      media2: dataUrl,
     });
-    return { ...result, transport: "rest_post_multipart_base64" };
+    return { ...result, transport: "rest_post_multipart_base64_media2" };
   } catch (postError) {
     // Keep the signed R2 URL only as a secondary compatibility path.
     if (!mediaUrl) throw postError;
