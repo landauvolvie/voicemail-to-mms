@@ -110,7 +110,7 @@ export default {
     try {
       logEvent("mms_attempt", eventId, {
         ...audioDetails,
-        transport: "rest_post_base64",
+        transport: "rest_post_multipart_base64",
         mediaUrlConfigured: Boolean(archive?.url),
       });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
@@ -143,7 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        outboundTransport: "VoIP.ms REST POST base64 primary; R2 media URL fallback",
+        outboundTransport: "VoIP.ms REST multipart POST base64 primary; R2 media URL fallback",
       });
     }
 
@@ -156,24 +156,23 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  // Send the recording bytes directly to VoIP.ms first. Their remote-media
-  // validator was returning invalid_media for WAV URLs even though the same
-  // WAV format works when uploaded directly in the VoIP.ms portal.
+  // VoIP.ms accepts base64 MMS media through POST, but their implementation
+  // expects multipart/form-data for larger base64 payloads. Sending the same
+  // payload as application/x-www-form-urlencoded produced a SOAP HTTP 500.
   const detectedMimeType = mimeFromAttachment(attachment);
   const mimeType = detectedMimeType === "audio/x-wav" ? "audio/wav" : detectedMimeType;
   const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
 
   try {
-    const result = await callVoipMsPost(env, "sendMMS", {
+    const result = await callVoipMsMultipart(env, "sendMMS", {
       did: normalizePhone(env.VOIPMS_DID),
       dst: normalizePhone(env.MMS_DESTINATION),
       message,
-      media2: dataUrl,
+      media1: dataUrl,
     });
-    return { ...result, transport: "rest_post_base64" };
+    return { ...result, transport: "rest_post_multipart_base64" };
   } catch (postError) {
-    // Keep the signed R2 URL only as a secondary compatibility path. This is
-    // useful if direct POST is temporarily blocked again at the provider edge.
+    // Keep the signed R2 URL only as a secondary compatibility path.
     if (!mediaUrl) throw postError;
 
     try {
@@ -185,7 +184,7 @@ async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
       });
       return { ...result, transport: "rest_get_media_url_fallback" };
     } catch (getError) {
-      throw new Error(`VoIP.ms direct-media POST failed: ${safeError(postError)}; media-URL GET fallback failed: ${safeError(getError)}`);
+      throw new Error(`VoIP.ms direct-media multipart POST failed: ${safeError(postError)}; media-URL GET fallback failed: ${safeError(getError)}`);
     }
   }
 }
@@ -301,6 +300,63 @@ async function callVoipMsGet(env, method, params = {}) {
   throw lastError || new Error(`VoIP.ms ${method} GET failed`);
 }
 
+async function callVoipMsMultipart(env, method, params = {}) {
+  const maxAttempts = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const form = new FormData();
+      form.set("api_username", env.VOIPMS_API_USERNAME);
+      form.set("api_password", env.VOIPMS_API_PASSWORD);
+      form.set("method", method);
+      form.set("content_type", "json");
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
+      }
+
+      const response = await fetch(VOIPMS_ENDPOINT, {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/plain, */*",
+          "accept-language": "en-US,en;q=0.9",
+          "cache-control": "no-cache",
+          "user-agent": "Mozilla/5.0 (compatible; voicemail-to-mms/1.0; +https://github.com/landauvolvie/voicemail-to-mms)",
+          "x-client-name": "voicemail-to-mms",
+        },
+        body: form,
+      });
+      const responseText = await response.text();
+      if (response.status === 403) {
+        throw new Error(describeVoipMsEdgeRejection(response, responseText, `${method} multipart POST`));
+      }
+
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        const reason = extractSoapReason(responseText);
+        throw new Error(`VoIP.ms ${method} multipart POST returned non-JSON (HTTP ${response.status})${reason ? `: ${reason}` : ""}`);
+      }
+
+      if (response.ok && data.status === "success") return data;
+
+      const status = String(data.status || `http_${response.status}`);
+      if (attempt < maxAttempts && isRetryableVoipStatus(status, response.status)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new Error(`VoIP.ms ${method} multipart POST failed: ${status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableException(error)) break;
+      await sleep(backoffMs(attempt));
+    }
+  }
+
+  throw lastError || new Error(`VoIP.ms ${method} multipart POST failed`);
+}
+
 async function callVoipMsPost(env, method, params = {}) {
   const maxAttempts = 3;
   let lastError;
@@ -362,6 +418,21 @@ function describeVoipMsEdgeRejection(response, text, method) {
   const rayId = response.headers.get("cf-ray") || "unavailable";
   const server = response.headers.get("server") || "unknown";
   return `VoIP.ms ${method} rejected at provider edge (HTTP 403; title=${title}; server=${server}; ray=${rayId})`;
+}
+
+function extractSoapReason(text) {
+  const value = String(text || "");
+  const match = value.match(/<(?:\w+:)?Text[^>]*>([\s\S]*?)<\/(?:\w+:)?Text>/i);
+  return String(match?.[1] || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
 }
 
 function parseVoipMsResponse(text, httpStatus) {
