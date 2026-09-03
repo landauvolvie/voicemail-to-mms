@@ -61,6 +61,22 @@ test("formats a short voicemail notification", () => {
 });
 
 
+test("reports the caller when someone rings their own forwarded line", () => {
+  // The subject's Caller ID field is authoritative even when it matches the
+  // MMS destination, which is what happens when the owner calls their own
+  // number and lands in voicemail.
+  const result = extractCallerIdentity(
+    'New  voicemail in mailbox 60971 from "8453241813" <8453241813>',
+    "8605060971",
+    "8453241813",
+  );
+  assert.deepEqual(result, { number: "8453241813", name: "" });
+  assert.match(
+    buildNotificationText(result, new Date("2026-09-03T01:06:57Z"), "America/New_York"),
+    /^Voicemail from 845-324-1813 - Sep 2, 2026, 9:06 PM$/,
+  );
+});
+
 test("parses the real VoIP.ms voicemail subject shape without treating a numeric caller ID as a name", () => {
   const result = extractCallerIdentity(
     'New voicemail in mailbox 60199 from "2035550182" <2035550182>',

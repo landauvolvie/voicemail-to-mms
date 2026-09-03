@@ -14,23 +14,7 @@ export default {
       return probeVoipMsEdge(request, env, ctx);
     }
 
-    const response = await worker.fetch(request, env, ctx);
-
-    // VoIP.ms accepts regular WAV uploads, but its remote-media validator can
-    // reject the legacy MIME type "audio/x-wav" returned by voicemail email
-    // attachments. Present signed .wav recording URLs as the standard
-    // "audio/wav" MIME type instead.
-    if (response.ok && url.pathname.startsWith("/recording/") && /\.wav$/i.test(url.pathname)) {
-      const headers = new Headers(response.headers);
-      headers.set("content-type", "audio/wav");
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-      });
-    }
-
-    return response;
+    return worker.fetch(request, env, ctx);
   },
 };
 

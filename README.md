@@ -9,8 +9,18 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 3. VoIP.ms records the voicemail and emails the MP3/WAV attachment to the Cloudflare Email Routing address.
 4. Cloudflare routes the email to this Worker.
 5. The Worker validates that the sender is from `voip.ms` or `voipinterface.net`, parses the voicemail email, extracts caller information and time, and finds the audio attachment.
-6. The Worker sends an MMS through the VoIP.ms `sendMMS` API containing a short message plus the voicemail recording.
-7. If MMS cannot be sent, the Worker sends a normal SMS fallback so the voicemail is not silently missed.
+6. The Worker transcodes the recording to mono MP3, stores it in R2, and publishes a short unguessable URL for it.
+7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message and `media1` set to that URL, which VoIP.ms fetches to build the MMS.
+8. If MMS cannot be sent, the Worker sends a normal SMS fallback carrying the same listening link so the voicemail is not silently missed.
+
+## Why the recording is transcoded and never inlined
+
+Two VoIP.ms behaviours drive the delivery path, both confirmed against the live API:
+
+- **`sendMMS` rejects WAV media** with `invalid_media`, even though WAV appears in the published list of permitted MMS attachments. MP3 is delivered normally, so every recording is converted to mono MP3 before it is sent. Asterisk voicemail writes 8 kHz audio; the Worker upsamples to 16 kHz so the MP3 is MPEG-2 Layer III rather than the less widely supported MPEG-2.5.
+- **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted.
+
+Because of the second point, R2 plus `PUBLIC_BASE_URL` are required for MMS delivery, not optional.
 
 ## Required Cloudflare variables/secrets
 
@@ -22,6 +32,9 @@ Configure these in **Workers & Pages → voicemail-to-mms → Settings → Varia
 | `VOIPMS_API_PASSWORD` | Secret | Dedicated VoIP.ms API password |
 | `VOIPMS_DID` | Text | SMS/MMS-capable VoIP.ms DID used as sender |
 | `MMS_DESTINATION` | Text | Phone number that receives the voicemail MMS |
+| `PUBLIC_BASE_URL` | Text | Public URL of this Worker, no trailing slash. VoIP.ms fetches the recording from here. |
+
+An R2 bucket bound as `VOICEMAIL_BUCKET` is also required: it stores the MP3 that VoIP.ms downloads.
 
 No credentials or phone numbers are committed to GitHub.
 
@@ -44,24 +57,29 @@ The recording is attached as the MMS media.
 ## Failure handling
 
 - Missing audio attachment: send an SMS telling the user to call voicemail.
-- Audio too large for the safe MMS/base64 threshold: send an SMS fallback.
-- VoIP.ms MMS failure: send an SMS fallback.
+- Audio too large for MMS after transcoding: send an SMS with a listening link.
+- Recording in a format the Worker cannot transcode (for example GSM 6.10 `wav49`): archive it as-is and send an SMS with a listening link.
+- No fetchable media URL configured: send an SMS naming that as the reason.
+- VoIP.ms MMS failure: send an SMS with a listening link.
 - Temporary VoIP.ms/API rate errors: retry with short exponential backoff.
 - Unexpected sender domains: reject the incoming email so the public voicemail address cannot easily be abused as an MMS relay.
 
-## Optional R2 archive and private listening links
+Fallback texts always keep the link intact - the caller/time prefix is shortened to fit 160 characters rather than truncating the URL.
 
-The Worker already supports R2, but R2 is not required for the normal voicemail-to-MMS flow.
+## R2 storage and listening links
 
-If an R2 binding named `VOICEMAIL_BUCKET` is added, every voicemail recording is archived. It also stores a processed-event marker so duplicate email delivery does not generate duplicate texts.
+The R2 bucket bound as `VOICEMAIL_BUCKET` holds three things:
 
-For private listening links, additionally configure:
+- `voicemails/<yyyy>/<mm>/<dd>/...` - the delivered MP3, which doubles as the MMS media VoIP.ms downloads.
+- `links/<token>` - a pointer that maps a 128-bit random token to a recording and an expiry.
+- `events/<id>.json` - a processed-event marker so duplicate email delivery does not generate duplicate texts.
 
-- `PUBLIC_BASE_URL` - public URL for this Worker, without a trailing slash.
-- `RECORDING_LINK_SECRET` - Secret used to sign expiring links.
-- `RECORDING_LINK_TTL_SECONDS` - optional; defaults to 7 days.
+Recording URLs look like `https://<worker-host>/r/<token>.mp3`. The token is the secret, which keeps the URL short enough to survive inside a 160-character SMS fallback; the previous long signed URL was cut off mid-link and unusable.
 
-When R2 + private links are configured, an oversized recording is stored in R2 and the fallback SMS contains a signed listening link instead of only telling the user to call voicemail.
+Optional:
+
+- `RECORDING_LINK_TTL_SECONDS` - link lifetime; defaults to 7 days.
+- `RECORDING_LINK_SECRET` - only needed to keep older `/recording/<signed>` links playable. New links do not use it.
 
 ## VoIP.ms requirements
 
@@ -69,7 +87,7 @@ When R2 + private links are configured, an oversized recording is stored in R2 a
 - API password configured separately from the portal password.
 - API source-IP policy configured to permit the Worker.
 - The chosen DID has SMS/MMS enabled and any required messaging/A2P verification completed.
-- Voicemail mailbox has **Attach Message to Email = Yes** and preferably **Attachment Format = MP3**.
+- Voicemail mailbox has **Attach Message to Email = Yes**. Either **WAV** or **MP3** attachment format works; WAV is transcoded by the Worker, MP3 is passed through untouched. Avoid **WAV49** (GSM 6.10), which the Worker cannot decode.
 - Voicemail notification email points to the Cloudflare Email Routing address connected to this Worker.
 - Keep **Delete Voicemail Message = No** if telephone access to saved voicemails should remain available.
 
@@ -82,4 +100,10 @@ npm test
 npm run deploy
 ```
 
-The parsing helpers have unit tests for NANP phone normalization, caller-name extraction, sender-domain validation, excluding the DID/destination from caller detection, and contact-name overrides.
+`npm run deploy` needs a Cloudflare login (`npx wrangler login`) or a `CLOUDFLARE_API_TOKEN` environment variable. Pushes to `main` also deploy through `.github/workflows/deploy.yml` when the `CLOUDFLARE_API_TOKEN` repository secret is set.
+
+Tests cover three layers:
+
+- `test/core.test.js` - NANP normalization, caller-ID extraction, sender-domain validation, contact-name overrides.
+- `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes) and MP3 output, verified by walking real MP3 frame headers for sample rate, version and duration.
+- `test/worker.test.js` - the whole email handler against a stubbed VoIP.ms API and an in-memory R2, asserting that `media1` is a fetchable MP3 URL, that the URL serves `audio/mpeg` with a content length over GET and HEAD, and that every SMS fallback fits one segment with its link intact.

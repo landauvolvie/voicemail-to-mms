@@ -30,10 +30,14 @@ export function extractCallerIdentity(text, ownDid, destination) {
   const excluded = new Set([own, dst].filter(Boolean));
 
   // Real VoIP.ms subjects use: New voicemail ... from "Caller Name" <number>.
+  // This is an explicit Caller ID field, so it wins outright — the DID and
+  // destination are only excluded when guessing at loose numbers below, and
+  // applying that filter here reports a real caller as "Unknown caller"
+  // whenever someone rings their own forwarded line.
   const subjectIdentity = clean.match(/\bfrom\s+(?:"([^"]*)"\s*)?<\s*([^>]+)\s*>/i);
   if (subjectIdentity) {
     const number = normalizePhone(subjectIdentity[2]);
-    if (number.length === 10 && !excluded.has(number)) {
+    if (number.length === 10) {
       return { number, name: sanitizeName(subjectIdentity[1] || "") };
     }
   }
@@ -113,13 +117,34 @@ export function buildNotificationText(identity, date, timeZone, contactsJson) {
   return `Voicemail from ${who} - ${when}`;
 }
 
+const FALLBACK_SUFFIXES = {
+  too_large: "Recording too large for MMS; call voicemail to listen.",
+  missing_audio: "Audio attachment missing; call voicemail to listen.",
+  transcode_failed: "Recording could not be converted for MMS; call voicemail to listen.",
+  unsupported_audio: "Recording format not supported for MMS; call voicemail to listen.",
+  unrecognized_audio_container: "Recording format not supported for MMS; call voicemail to listen.",
+  media_url_unconfigured: "MMS media hosting is not configured; call voicemail to listen.",
+  media_url_unavailable: "Recording could not be published for MMS; call voicemail to listen.",
+};
+
 export function buildFallbackText(notificationText, reason) {
-  const suffix = reason === "too_large"
-    ? "Recording too large for MMS; call voicemail to listen."
-    : reason === "missing_audio"
-      ? "Audio attachment missing; call voicemail to listen."
-      : "MMS delivery failed; call voicemail to listen.";
+  const suffix = FALLBACK_SUFFIXES[reason] || "MMS delivery failed; call voicemail to listen.";
   return truncateSms(`${notificationText}. ${suffix}`, 160);
+}
+
+/**
+ * Build a one-segment SMS that always contains a usable listening link.
+ *
+ * Truncating the combined string would cut characters off the end of the URL,
+ * so the caller context is shortened to make room for the link instead.
+ */
+export function buildLinkFallbackText(notificationText, link, max = 160) {
+  const url = String(link || "");
+  if (!url) return truncateSms(notificationText, max);
+  const suffix = `. Listen: ${url}`;
+  const room = max - suffix.length;
+  if (room < 20) return url.length <= max ? url : truncateSms(notificationText, max);
+  return `${truncateSms(notificationText, room)}${suffix}`;
 }
 
 export function findAudioAttachment(attachments = []) {
@@ -147,13 +172,16 @@ export function toUint8Array(content) {
   throw new Error("Unsupported voicemail attachment format.");
 }
 
-export function bytesToBase64(bytes) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+export function contentTypeForExtension(extension, fallback = "application/octet-stream") {
+  switch (String(extension || "").toLowerCase()) {
+    case "mp3":
+      return "audio/mpeg";
+    case "wav":
+    case "wav49":
+      return "audio/wav";
+    default:
+      return fallback || "application/octet-stream";
   }
-  return btoa(binary);
 }
 
 export function mimeFromAttachment(attachment = {}) {

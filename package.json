@@ -3,11 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/diagnostic-wrapper.js && node --check src/index.js && node --check src/core.js",
+    "check": "node --check src/diagnostic-wrapper.js && node --check src/index.js && node --check src/core.js && node --check src/audio.js",
     "test": "node --test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "postal-mime": "^2.4.3"
   },
   "devDependencies": {
