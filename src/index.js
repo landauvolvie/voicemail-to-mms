@@ -110,7 +110,7 @@ export default {
     try {
       logEvent("mms_attempt", eventId, {
         ...audioDetails,
-        transport: "rest_post_multipart_raw_base64_media1",
+        transport: "rest_post_multipart_data_url_media1_no_content_type",
         mediaUrlConfigured: Boolean(archive?.url),
       });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
@@ -143,7 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        outboundTransport: "VoIP.ms REST multipart POST raw base64 in media1 primary; R2 media URL fallback",
+        outboundTransport: "VoIP.ms multipart POST data URL in media1 without content_type; R2 media URL fallback",
       });
     }
 
@@ -156,22 +156,22 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  // A known-working VoIP.ms integration sends the media as raw base64 in
-  // multipart field media1, with no data: URI prefix and no MIME metadata.
-  // Match that format exactly; the previous data URI was accepted by the API
-  // but produced a zero-byte attachment in the VoIP.ms portal.
-  const rawBase64 = bytesToBase64(audioBytes);
+  // Match a known-working VoIP.ms multipart request: media1 contains a full
+  // data: URL and the multipart request does not include content_type=json.
+  // VoIP.ms's MMS parser behaves differently when content_type is supplied.
+  const detectedMimeType = mimeFromAttachment(attachment);
+  const mimeType = detectedMimeType === "audio/x-wav" ? "audio/wav" : detectedMimeType;
+  const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
 
   try {
     const result = await callVoipMsMultipart(env, "sendMMS", {
       did: normalizePhone(env.VOIPMS_DID),
       dst: normalizePhone(env.MMS_DESTINATION),
       message,
-      media1: rawBase64,
+      media1: dataUrl,
     });
-    return { ...result, transport: "rest_post_multipart_raw_base64_media1" };
+    return { ...result, transport: "rest_post_multipart_data_url_media1_no_content_type" };
   } catch (postError) {
-    // Keep the signed R2 URL only as a secondary compatibility path.
     if (!mediaUrl) throw postError;
 
     try {
@@ -191,8 +191,6 @@ async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
 async function sendFallbackSms(env, message) {
   const text = truncateForSms(message, 160);
 
-  // Test/use GET first as a separate path around the provider edge rule that
-  // has been rejecting POST requests from Cloudflare Workers.
   try {
     const result = await callVoipMsGet(env, "sendSMS", {
       did: normalizePhone(env.VOIPMS_DID),
@@ -309,7 +307,6 @@ async function callVoipMsMultipart(env, method, params = {}) {
       form.set("api_username", env.VOIPMS_API_USERNAME);
       form.set("api_password", env.VOIPMS_API_PASSWORD);
       form.set("method", method);
-      form.set("content_type", "json");
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
       }
@@ -469,9 +466,11 @@ async function archiveVoicemailIfConfigured(env, details) {
   const [year, month, day] = ymd.split("-");
   const caller = safeFilenamePart(details.identity?.number || details.identity?.name || "unknown");
   const key = `voicemails/${year}/${month}/${day}/${details.eventId}-${caller}.${ext}`;
+  const detectedContentType = mimeFromAttachment(details.audio);
+  const contentType = ext === "wav" || detectedContentType === "audio/x-wav" ? "audio/wav" : detectedContentType;
 
   await env.VOICEMAIL_BUCKET.put(key, details.audioBytes, {
-    httpMetadata: { contentType: mimeFromAttachment(details.audio) },
+    httpMetadata: { contentType },
     customMetadata: {
       callerNumber: details.identity?.number || "",
       callerName: details.identity?.name || "",
@@ -523,8 +522,9 @@ async function servePrivateRecording(request, env) {
   if (!object) return new Response("Recording not found", { status: 404 });
   const headers = new Headers();
   object.writeHttpMetadata(headers);
+  if (key.toLowerCase().endsWith(".wav")) headers.set("content-type", "audio/wav");
   headers.set("cache-control", "private, no-store");
-  headers.set("content-disposition", `inline; filename="${key.split("/").pop()?.replace(/[^a-zA-Z0-9_.-]/g, "_") || "voicemail.mp3"}"`);
+  headers.set("content-disposition", `inline; filename="${key.split("/").pop()?.replace(/[^a-zA-Z0-9_.-]/g, "_") || "voicemail.wav"}"`);
   return new Response(object.body, { headers });
 }
 
