@@ -110,7 +110,7 @@ export default {
     try {
       logEvent("mms_attempt", eventId, {
         ...audioDetails,
-        transport: "rest_post_multipart_base64_media2",
+        transport: "rest_post_multipart_raw_base64_media1",
         mediaUrlConfigured: Boolean(archive?.url),
       });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
@@ -143,7 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        outboundTransport: "VoIP.ms REST multipart POST base64 in media2 primary; R2 media URL fallback",
+        outboundTransport: "VoIP.ms REST multipart POST raw base64 in media1 primary; R2 media URL fallback",
       });
     }
 
@@ -156,21 +156,20 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  // VoIP.ms uses media1 for a remote media URL and media2 for a base64 data
-  // URI. Keep the WAV bytes in media2 so the provider does not accept the MMS
-  // while silently creating a zero-byte media attachment.
-  const detectedMimeType = mimeFromAttachment(attachment);
-  const mimeType = detectedMimeType === "audio/x-wav" ? "audio/wav" : detectedMimeType;
-  const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
+  // A known-working VoIP.ms integration sends the media as raw base64 in
+  // multipart field media1, with no data: URI prefix and no MIME metadata.
+  // Match that format exactly; the previous data URI was accepted by the API
+  // but produced a zero-byte attachment in the VoIP.ms portal.
+  const rawBase64 = bytesToBase64(audioBytes);
 
   try {
     const result = await callVoipMsMultipart(env, "sendMMS", {
       did: normalizePhone(env.VOIPMS_DID),
       dst: normalizePhone(env.MMS_DESTINATION),
       message,
-      media2: dataUrl,
+      media1: rawBase64,
     });
-    return { ...result, transport: "rest_post_multipart_base64_media2" };
+    return { ...result, transport: "rest_post_multipart_raw_base64_media1" };
   } catch (postError) {
     // Keep the signed R2 URL only as a secondary compatibility path.
     if (!mediaUrl) throw postError;
