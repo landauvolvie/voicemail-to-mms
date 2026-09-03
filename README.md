@@ -100,7 +100,7 @@ npm test
 npm run deploy
 ```
 
-`npm run deploy` needs a Cloudflare login (`npx wrangler login`) or a `CLOUDFLARE_API_TOKEN` environment variable. Pushes to `main` also deploy through `.github/workflows/deploy.yml` when the `CLOUDFLARE_API_TOKEN` repository secret is set.
+Cloudflare's Git integration deploys this Worker automatically on every push to `main`, so no deploy step runs in GitHub Actions. `npm run deploy` is only for deploying a local working copy, and needs `npx wrangler login` or a `CLOUDFLARE_API_TOKEN` environment variable.
 
 Tests cover three layers:
 
