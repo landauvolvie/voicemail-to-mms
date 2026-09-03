@@ -17,7 +17,7 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 
 Three behaviours drive the delivery path, all observed against the live API and a real handset:
 
-- **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted. R2 plus `PUBLIC_BASE_URL` are therefore required, not optional.
+- **`media1` as a base64 string produces a zero-byte attachment.** Base64 in `media1`/`media2` and a `data:` URL are all accepted by the API and return `status: success` with a message ID, but the delivered message carries a **zero-byte, zero-second attachment**. A base64 string is never sent.
 - **The recording is not the problem.** The exact WAV this Worker produces was downloaded from its own link and uploaded by hand through the VoIP.ms portal; that message arrived and played on the handset. Canonical mono 16-bit PCM at 8 kHz, 44-byte header.
 - **The carrier drops MP3.** Confirmed both through this Worker and by sending an MP3 by hand from the portal to the same handset. MP3 is the worse failure of the two, because `sendMMS` reports success, no fallback fires, and nothing arrives.
 - **`sendMMS` refuses those same WAV bytes when they are passed as a URL** (`invalid_media`) or as a base64 string. The URL shape is not the cause — a clean extension-terminated URL with a content length and HEAD support is refused identically.
@@ -51,9 +51,9 @@ Configure these in **Workers & Pages → voicemail-to-mms → Settings → Varia
 | `VOIPMS_API_PASSWORD` | Secret | Dedicated VoIP.ms API password |
 | `VOIPMS_DID` | Text | SMS/MMS-capable VoIP.ms DID used as sender |
 | `MMS_DESTINATION` | Text | Phone number that receives the voicemail MMS |
-| `PUBLIC_BASE_URL` | Text | Public URL of this Worker, no trailing slash. VoIP.ms fetches the recording from here. |
+| `PUBLIC_BASE_URL` | Text | Public URL of this Worker, no trailing slash. Backs the SMS listening link and the URL transport. |
 
-An R2 bucket bound as `VOICEMAIL_BUCKET` is also required: it stores the recording that VoIP.ms downloads.
+An R2 bucket bound as `VOICEMAIL_BUCKET` stores the recordings and backs the listening links. The default file-upload transport carries the audio in the request itself, so MMS delivery does not depend on either.
 
 No credentials or phone numbers are committed to GitHub.
 
@@ -93,7 +93,7 @@ Fallback texts always keep the link intact - the caller/time prefix is shortened
 
 The R2 bucket bound as `VOICEMAIL_BUCKET` holds three things:
 
-- `voicemails/<yyyy>/<mm>/<dd>/...` - the prepared recording, which doubles as the MMS media VoIP.ms downloads.
+- `voicemails/<yyyy>/<mm>/<dd>/...` - the prepared recording, also served to VoIP.ms when a URL transport is used.
 - `probes/...` - test clips from `/diagnostics/media-probe`.
 - `links/<token>` - a pointer that maps a 128-bit random token to a recording and an expiry.
 - `events/<id>.json` - a processed-event marker so duplicate email delivery does not generate duplicate texts.
