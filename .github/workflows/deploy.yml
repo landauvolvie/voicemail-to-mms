@@ -11,8 +11,8 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Skips cleanly instead of failing when the token has not been added yet.
-    if: ${{ github.repository_owner != '' && vars.DEPLOY_ON_PUSH != 'false' }}
+    # Set the repository variable DEPLOY_ON_PUSH=false to turn off auto-deploy.
+    if: ${{ vars.DEPLOY_ON_PUSH != 'false' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
