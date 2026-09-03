@@ -1,5 +1,6 @@
 import PostalMime from "postal-mime";
 import { DEFAULT_MMS_FORMATS, buildMmsCandidates, parseMmsFormats } from "./audio.js";
+import { PROBE_VARIANTS, buildProbeMedia, parseProbeVariants } from "./probe.js";
 import {
   MAX_MMS_AUDIO_BYTES,
   buildFallbackText,
@@ -7,6 +8,7 @@ import {
   buildNotificationText,
   contentTypeForExtension,
   extensionForAttachment,
+  formatPhone,
   extractCallerIdentity,
   extractVoicemailDate,
   formatDate,
@@ -26,6 +28,7 @@ const MEDIA_URL_BINDINGS = ["VOICEMAIL_BUCKET", "PUBLIC_BASE_URL"];
 const MMS_TRANSPORT = "rest_get_media_url";
 const RECORDING_PREFIX = "voicemails/";
 const LINK_PREFIX = "links/";
+const PROBE_PREFIX = "probes/";
 
 export default {
   async email(message, env) {
@@ -105,8 +108,8 @@ export default {
 
     const blocked = undeliverableReason(env, prepared, stored);
     if (blocked) {
-      const fallback = stored[0]?.url
-        ? buildLinkFallbackText(notificationText, stored[0].url)
+      const fallback = stored[0]?.pageUrl
+        ? buildLinkFallbackText(notificationText, stored[0].pageUrl)
         : buildFallbackText(notificationText, blocked);
       logEvent("fallback_attempt", eventId, { reason: blocked, transport: "rest_get" }, "warn");
       const result = await sendFallbackSms(env, fallback);
@@ -136,7 +139,7 @@ export default {
     }
 
     logEvent("mms_failure", eventId, { error: failures.join("; ") }, "error");
-    const fallback = buildLinkFallbackText(notificationText, stored[0].url);
+    const fallback = buildLinkFallbackText(notificationText, stored[0].pageUrl);
     logEvent("fallback_attempt", eventId, { reason: "mms_failed", transport: "rest_get" }, "warn");
     const result = await sendFallbackSms(env, fallback);
     logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "", transport: result.transport || "unknown" });
@@ -162,6 +165,10 @@ export default {
         defaultMmsMediaFormats: DEFAULT_MMS_FORMATS,
         outboundTransport: "VoIP.ms sendMMS GET with media1 = recording URL, first accepted format wins",
       });
+    }
+
+    if (url.pathname === "/diagnostics/media-probe") {
+      return runMediaProbe(request, env);
     }
 
     if (url.pathname.startsWith("/r/")) {
@@ -404,7 +411,7 @@ function sleep(ms) {
 async function archiveCandidatesIfConfigured(env, details) {
   const { prepared } = details;
   const media = prepared.candidates.length ? prepared.candidates : [prepared.original].filter(Boolean);
-  if (!env.VOICEMAIL_BUCKET || !media.length) return media.map((candidate) => ({ ...candidate, url: "" }));
+  if (!env.VOICEMAIL_BUCKET || !media.length) return media.map((candidate) => ({ ...candidate, url: "", pageUrl: "" }));
 
   const date = details.voicemailDate instanceof Date ? details.voicemailDate : new Date(details.voicemailDate);
   const iso = Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
@@ -423,7 +430,7 @@ async function archiveCandidatesIfConfigured(env, details) {
         receivedAt: iso,
       },
     });
-    stored.push({ ...candidate, key, url: await publishRecordingLink(env, key) });
+    stored.push({ ...candidate, key, ...(await publishRecordingLink(env, key)) });
   }
 
   console.log(`Archived voicemail ${details.eventId} to R2 as ${stored.map((c) => c.extension).join(", ")}.`);
@@ -431,15 +438,16 @@ async function archiveCandidatesIfConfigured(env, details) {
 }
 
 /**
- * Publish a short, unguessable URL for a recording.
+ * Publish short, unguessable URLs for a recording.
  *
- * The URL has to survive inside a 160-character SMS fallback, so the link is a
+ * A URL has to survive inside a 160-character SMS fallback, so the link is a
  * 128-bit random token backed by a pointer object rather than a long signed
- * path. VoIP.ms fetches this same URL as the MMS media.
+ * path. `url` carries the file extension and is what VoIP.ms fetches as MMS
+ * media; `pageUrl` is the bare token, which renders a player page for people.
  */
 async function publishRecordingLink(env, key) {
   const base = String(env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-  if (!base) return "";
+  if (!base) return { url: "", pageUrl: "" };
 
   const ttl = clampInt(env.RECORDING_LINK_TTL_SECONDS, 60, 30 * 24 * 60 * 60, 7 * 24 * 60 * 60);
   const token = randomToken();
@@ -449,8 +457,57 @@ async function publishRecordingLink(env, key) {
     { httpMetadata: { contentType: "application/json" } },
   );
 
-  const extension = key.split(".").pop();
-  return `${base}/r/${token}.${extension}`;
+  return { url: `${base}/r/${token}.${key.split(".").pop()}`, pageUrl: `${base}/r/${token}` };
+}
+
+/**
+ * Send one test MMS per media variant and report which ones sendMMS accepts.
+ *
+ * Voicemail-at-a-time testing costs a call and a wait per format. This sends
+ * the whole set in one request, so the API's own verdict on each encoding is
+ * known immediately and only the delivery question is left for the handset.
+ * It sends real, billable messages, so it needs the key and never self-runs.
+ */
+async function runMediaProbe(request, env) {
+  const secret = env.PROBE_KEY || env.RECORDING_LINK_SECRET || "";
+  const supplied = new URL(request.url).searchParams.get("key") || "";
+  if (!secret || !timingSafeEqual(supplied, secret)) {
+    return new Response("Not found", { status: 404 });
+  }
+  if (missingBindings(env).length || missingBindings(env, MEDIA_URL_BINDINGS).length) {
+    return Response.json({ ok: false, error: "Worker bindings for MMS media are incomplete" }, { status: 503 });
+  }
+
+  const url = new URL(request.url);
+  const variants = parseProbeVariants(url.searchParams.get("variants"));
+  const seconds = clampInt(url.searchParams.get("seconds"), 1, 10, 2);
+  const results = [];
+
+  for (const [index, name] of variants.entries()) {
+    const label = `Probe ${index + 1}/${variants.length}: ${name}`;
+    try {
+      const media = buildProbeMedia(name, seconds);
+      const key = `probes/${Date.now()}-${name}.${media.extension}`;
+      await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
+        httpMetadata: { contentType: contentTypeForExtension(media.extension, media.mimeType) },
+      });
+      const { url: mediaUrl } = await publishRecordingLink(env, key);
+      const result = await sendMms(env, label, mediaUrl);
+      results.push({ variant: name, bytes: media.bytes.byteLength, accepted: true, messageId: result.mms || "", mediaUrl });
+      logEvent("probe_accepted", "media-probe", { variant: name, bytes: media.bytes.byteLength });
+    } catch (error) {
+      results.push({ variant: name, accepted: false, error: safeError(error) });
+      logEvent("probe_rejected", "media-probe", { variant: name, error: safeError(error) }, "warn");
+    }
+  }
+
+  return Response.json({
+    ok: true,
+    note: "Each accepted variant was sent as a real MMS. Check which of the numbered probes actually arrive on the handset.",
+    accepted: results.filter((r) => r.accepted).map((r) => r.variant),
+    rejected: results.filter((r) => !r.accepted).map((r) => r.variant),
+    results,
+  });
 }
 
 async function serveTokenRecording(request, env) {
@@ -470,10 +527,56 @@ async function serveTokenRecording(request, env) {
     return new Response("Recording not found", { status: 404 });
   }
 
-  if (!target?.key?.startsWith(RECORDING_PREFIX)) return new Response("Recording not found", { status: 404 });
+  if (!target?.key?.startsWith(RECORDING_PREFIX) && !target?.key?.startsWith(PROBE_PREFIX)) {
+    return new Response("Recording not found", { status: 404 });
+  }
   if (Number(target.expiresAt) < Date.now()) return new Response("Recording link expired", { status: 403 });
 
+  // A bare token renders a player page; the same token plus the file extension
+  // serves the audio itself, which is what VoIP.ms fetches as MMS media.
+  if (!url.pathname.slice("/r/".length).includes(".")) {
+    const object = await env.VOICEMAIL_BUCKET.head(target.key);
+    if (!object) return new Response("Recording not found", { status: 404 });
+    return recordingPlayerPage(`${url.origin}/r/${token}.${target.key.split(".").pop()}`, object.customMetadata || {});
+  }
+
   return streamRecording(env, target.key, request.method === "HEAD");
+}
+
+function recordingPlayerPage(audioUrl, meta) {
+  const caller = formatPhone(meta.callerNumber || "") || meta.callerName || "Unknown caller";
+  const received = meta.receivedAt ? formatDate(meta.receivedAt) : "";
+  const page = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voicemail</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font: 16px/1.5 system-ui, -apple-system, sans-serif; background: #f4f5f7; color: #14161a; }
+  @media (prefers-color-scheme: dark) { body { background: #16181d; color: #f2f3f5; } }
+  .card { width: min(30rem, 92vw); padding: 1.75rem; border-radius: 1rem; background: #fff;
+          box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 8px 24px rgba(0,0,0,.08); }
+  @media (prefers-color-scheme: dark) { .card { background: #22252c; box-shadow: none; } }
+  h1 { margin: 0 0 .25rem; font-size: 1.35rem; }
+  p { margin: 0 0 1.25rem; opacity: .7; font-size: .95rem; }
+  audio { width: 100%; }
+</style>
+</head><body><div class="card">
+<h1>${escapeHtml(caller)}</h1>
+<p>${escapeHtml(received)}</p>
+<audio controls autoplay preload="auto" src="${escapeHtml(audioUrl)}"></audio>
+</div></body></html>`;
+
+  return new Response(page, {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store" },
+  });
+}
+
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[char]));
 }
 
 async function buildPrivateRecordingUrl(env, key) {

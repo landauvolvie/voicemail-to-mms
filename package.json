@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/diagnostic-wrapper.js && node --check src/index.js && node --check src/core.js && node --check src/audio.js",
+    "check": "node --check src/diagnostic-wrapper.js && node --check src/index.js && node --check src/core.js && node --check src/audio.js && node --check src/probe.js",
     "test": "node --test",
     "deploy": "wrangler deploy"
   },

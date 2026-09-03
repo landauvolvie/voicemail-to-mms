@@ -190,7 +190,7 @@ test("sends the voicemail as an MMS whose media1 is a fetchable WAV URL", async 
 });
 
 test("falls back to the MP3 candidate when VoIP.ms rejects the WAV", async () => {
-  const env = makeEnv();
+  const env = makeEnv({ MMS_MEDIA_FORMATS: "wav,mp3" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (url) =>
     /\.wav$/.test(url.searchParams.get("media1") || "")
       ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
@@ -231,8 +231,15 @@ test("serves the signed recording URL with an audio content type and length", as
   assert.equal(head.headers.get("content-type"), "audio/wav");
   assert.equal(head.headers.get("content-length"), String(body.byteLength));
 
-  const unknown = await worker.fetch(new Request(mediaUrl.replace(/\/r\/./, "/r/z")), env);
-  assert.equal(unknown.status, 404, "an unknown token must not resolve to a recording");
+  // A token of the right shape that was never issued, rather than a mutation of
+  // the real one — flipping a character can land back on the issued token.
+  const unknown = mediaUrl.replace(/\/r\/[^.]+/, `/r/${"A".repeat(22)}`);
+  assert.notEqual(unknown, mediaUrl);
+  assert.equal(
+    (await worker.fetch(new Request(unknown), env)).status,
+    404,
+    "an unknown token must not resolve to a recording",
+  );
 });
 
 test("passes an MP3 attachment through without re-encoding", async () => {
@@ -255,18 +262,24 @@ test("falls back to SMS with a listening link when VoIP.ms rejects the MMS", asy
       ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
       : okSms());
 
-  assert.equal(calls.length, 3, "both media formats attempted, then SMS");
-  assert.equal(calls[2].url.searchParams.get("method"), "sendSMS");
-  const text = calls[2].url.searchParams.get("message");
+  assert.equal(calls.length, 2, "the WAV candidate, then SMS");
+  assert.equal(calls[1].url.searchParams.get("method"), "sendSMS");
+  const text = calls[1].url.searchParams.get("message");
   assert.ok(text.length <= 160, `SMS must fit one segment, got ${text.length}`);
 
   // A link cut short by the 160-character limit is useless, so assert the URL
   // in the SMS actually resolves.
   const [, link] = text.match(/Listen: (\S+)$/) || [];
   assert.ok(link, `expected an untruncated link in ${text}`);
-  const played = await worker.fetch(new Request(link), env);
-  assert.equal(played.status, 200);
-  assert.ok(isRiffWave(new Uint8Array(await played.arrayBuffer())));
+  const page = await worker.fetch(new Request(link), env);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get("content-type"), /text\/html/);
+  const html = await page.text();
+  assert.match(html, /914-555-0100/, "the player page names the caller");
+  const [, audioSrc] = html.match(/<audio[^>]*src="([^"]+)"/) || [];
+  assert.ok(audioSrc, "player page should embed an audio element");
+  const audio = await worker.fetch(new Request(audioSrc), env);
+  assert.ok(isRiffWave(new Uint8Array(await audio.arrayBuffer())));
 });
 
 test("falls back to SMS when no fetchable media URL can be produced", async () => {
@@ -295,9 +308,9 @@ test("falls back to SMS when the attachment cannot be transcoded", async () => {
   assert.ok(text.length <= 160, `SMS must fit one segment, got ${text.length}`);
   const [, link] = text.match(/Listen: (\S+)$/) || [];
   assert.ok(link, `expected an untruncated link in ${text}`);
-  const played = await worker.fetch(new Request(link), env);
-  assert.equal(played.status, 200);
-  assert.equal(played.headers.get("content-type"), "audio/wav");
+  const page = await worker.fetch(new Request(link), env);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get("content-type"), /text\/html/);
 });
 
 test("ignores a duplicate delivery of the same voicemail email", async () => {
@@ -312,6 +325,6 @@ test("health endpoint reports the media-URL transport", async () => {
   const body = await response.json();
   assert.equal(body.mmsMediaReady, true);
   assert.deepEqual(body.mmsMediaMissingBindings, []);
-  assert.deepEqual(body.mmsMediaFormats, ["wav", "mp3"]);
+  assert.deepEqual(body.mmsMediaFormats, ["wav"]);
   assert.match(body.outboundTransport, /first accepted format wins/);
 });

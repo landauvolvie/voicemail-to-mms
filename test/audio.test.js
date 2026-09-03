@@ -192,8 +192,12 @@ test("transcodes an 8 kHz WAV voicemail into a decodable MP3", () => {
   assert.ok(Math.abs(mp3.durationSeconds - 3) < 0.2, `unexpected duration ${mp3.durationSeconds}`);
 });
 
-test("offers WAV before MP3 so the handset-playable format is tried first", () => {
-  const { candidates, durationSeconds } = buildMmsCandidates(buildWav(tone(2)));
+test("defaults to WAV only, since an accepted MP3 is silently dropped in transit", () => {
+  assert.deepEqual(parseMmsFormats(""), ["wav"]);
+});
+
+test("offers WAV before MP3 when both are requested", () => {
+  const { candidates, durationSeconds } = buildMmsCandidates(buildWav(tone(2)), ["wav", "mp3"]);
 
   assert.deepEqual(candidates.map((c) => c.format), ["wav", "mp3"]);
   assert.equal(durationSeconds, 2);
@@ -213,8 +217,7 @@ test("offers WAV before MP3 so the handset-playable format is tried first", () =
 test("honours a configured format order", () => {
   assert.deepEqual(parseMmsFormats("mp3,wav"), ["mp3", "wav"]);
   assert.deepEqual(parseMmsFormats("MP3"), ["mp3"]);
-  assert.deepEqual(parseMmsFormats(""), ["wav", "mp3"]);
-  assert.deepEqual(parseMmsFormats("ogg,flac"), ["wav", "mp3"], "unknown formats fall back to the default");
+  assert.deepEqual(parseMmsFormats("ogg,flac"), ["wav"], "unknown formats fall back to the default");
 
   const { candidates } = buildMmsCandidates(buildWav(tone(1)), parseMmsFormats("mp3"));
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
@@ -223,12 +226,12 @@ test("honours a configured format order", () => {
 test("drops the WAV candidate once it outgrows MMS", () => {
   // 16-bit 8 kHz PCM is 16 KB/s, so this clip lands well past the WAV ceiling.
   const seconds = MAX_WAV_MMS_BYTES / 16000 + 5;
-  const { candidates } = buildMmsCandidates(buildWav(tone(seconds)));
+  const { candidates } = buildMmsCandidates(buildWav(tone(seconds)), ["wav", "mp3"]);
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"], "long recordings ship as MP3 only");
 });
 
 test("an MP3 attachment can only ship as MP3", () => {
-  const mp3 = buildMmsCandidates(buildWav(tone(1))).candidates.find((c) => c.format === "mp3").bytes;
+  const mp3 = buildMmsCandidates(buildWav(tone(1)), ["mp3"]).candidates[0].bytes;
   const { candidates } = buildMmsCandidates(mp3);
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
   assert.equal(candidates[0].transcoded, false);

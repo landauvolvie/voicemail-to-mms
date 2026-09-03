@@ -1,16 +1,19 @@
 import lamejs from "@breezystack/lamejs";
 
-// Two constraints pull in opposite directions, so the recording is offered to
-// VoIP.ms in more than one format and the first one it accepts is delivered:
+// Two constraints pull in opposite directions and, so far, admit no overlap:
 //
-//   - The sendMMS media validator has rejected WAV with `invalid_media`, while
-//     MP3 is accepted and rendered.
-//   - The receiving handset plays WAV but ignores MP3, so an accepted MP3 can
-//     still arrive as a message with nothing to play.
+//   - `sendMMS` refuses WAV with `invalid_media`. Confirmed across a media
+//     URL, base64, multipart, a data: URL, and a canonical mono 16-bit PCM
+//     file served from a clean extension-terminated URL with a content length.
+//   - The receiving carrier drops MP3. Confirmed both through this Worker and
+//     by sending the same file by hand from the VoIP.ms portal.
 //
-// WAV is therefore tried first and MP3 is the fallback. `MMS_MEDIA_FORMATS`
-// overrides the order without a code change.
-export const DEFAULT_MMS_FORMATS = ["wav", "mp3"];
+// So MP3 is accepted by the API and then vanishes, which is worse than a
+// refusal: sendMMS reports success, no fallback fires, and nothing arrives.
+// The default therefore offers WAV only — if VoIP.ms refuses it the Worker
+// falls back to an SMS carrying a link that actually plays. Add "mp3" to
+// `MMS_MEDIA_FORMATS` if the carrier ever starts accepting it.
+export const DEFAULT_MMS_FORMATS = ["wav"];
 export const MP3_BITRATE_KBPS = 32;
 export const MP3_MIME_TYPE = "audio/mpeg";
 export const WAV_MIME_TYPE = "audio/wav";
@@ -173,9 +176,40 @@ export function transcodeWavToMp3(bytes, bitrateKbps = MP3_BITRATE_KBPS) {
   };
 }
 
-/** Write mono PCM samples as a canonical 44-byte-header RIFF/WAVE file. */
-export function encodeWav(samples, sampleRate) {
+/** Write mono samples as an 8-bit mu-law RIFF/WAVE file (telephony's own WAV). */
+export function encodeWavMulaw(samples, sampleRate) {
+  const out = new Uint8Array(58 + samples.length);
+  const view = new DataView(out.buffer);
+  const ascii = (offset, text) => {
+    for (let i = 0; i < text.length; i++) out[offset + i] = text.charCodeAt(i);
+  };
+
+  ascii(0, "RIFF");
+  view.setUint32(4, 50 + samples.length, true);
+  ascii(8, "WAVE");
+  ascii(12, "fmt ");
+  view.setUint32(16, 18, true); // mu-law needs the extended fmt chunk
+  view.setUint16(20, WAVE_FORMAT_MULAW, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  view.setUint16(36, 0, true);
+  ascii(38, "fact");
+  view.setUint32(42, 4, true);
+  view.setUint32(46, samples.length, true);
+  ascii(50, "data");
+  view.setUint32(54, samples.length, true);
+  for (let i = 0; i < samples.length; i++) out[58 + i] = pcm16ToMuLaw(samples[i]);
+
+  return out;
+}
+
+/** Write interleaved PCM samples as a canonical 44-byte-header RIFF/WAVE file. */
+export function encodeWav(samples, sampleRate, channels = 1) {
   const dataBytes = samples.length * 2;
+  const blockAlign = channels * 2;
   const out = new Uint8Array(44 + dataBytes);
   const view = new DataView(out.buffer);
   const ascii = (offset, text) => {
@@ -188,10 +222,10 @@ export function encodeWav(samples, sampleRate) {
   ascii(12, "fmt ");
   view.setUint32(16, 16, true);
   view.setUint16(20, WAVE_FORMAT_PCM, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(22, channels, true);
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
   view.setUint16(34, 16, true);
   ascii(36, "data");
   view.setUint32(40, dataBytes, true);
@@ -333,6 +367,20 @@ function downmixToMono(samples, channels) {
     out[frame] = clampPcm16(sum / channels);
   }
   return out;
+}
+
+function pcm16ToMuLaw(sample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  let value = Math.max(-CLIP, Math.min(CLIP, sample));
+  const sign = value < 0 ? 0x80 : 0;
+  if (value < 0) value = -value;
+  value += BIAS;
+
+  let exponent = 7;
+  for (let mask = 0x4000; (value & mask) === 0 && exponent > 0; mask >>= 1) exponent--;
+  const mantissa = (value >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
 function muLawToPcm16(value) {

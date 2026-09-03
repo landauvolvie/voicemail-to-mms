@@ -9,8 +9,8 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 3. VoIP.ms records the voicemail and emails the MP3/WAV attachment to the Cloudflare Email Routing address.
 4. Cloudflare routes the email to this Worker.
 5. The Worker validates that the sender is from `voip.ms` or `voipinterface.net`, parses the voicemail email, extracts caller information and time, and finds the audio attachment.
-6. The Worker transcodes the recording to mono MP3, stores it in R2, and publishes a short unguessable URL for it.
-7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message and `media1` set to that URL, which VoIP.ms fetches to build the MMS.
+6. The Worker re-encodes the recording into the configured media formats, stores them in R2, and publishes a short unguessable URL for each.
+7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message and `media1` set to a recording URL, which VoIP.ms fetches to build the MMS. If VoIP.ms refuses one format the next is offered.
 8. If MMS cannot be sent, the Worker sends a normal SMS fallback carrying the same listening link so the voicemail is not silently missed.
 
 ## How the media is delivered
@@ -18,12 +18,18 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 Three behaviours drive the delivery path, all observed against the live API and a real handset:
 
 - **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted. R2 plus `PUBLIC_BASE_URL` are therefore required, not optional.
-- **`sendMMS` has rejected WAV media** with `invalid_media` while accepting MP3.
-- **The receiving handset plays WAV but ignores MP3**, so an MP3 the API accepts can still arrive as a message with nothing to play.
+- **`sendMMS` refuses WAV** with `invalid_media`. Confirmed across five encodings: a media URL, base64, multipart, a `data:` URL, and a canonical mono 16-bit PCM file served from a clean extension-terminated URL with a content length and HEAD support. The URL shape is not the cause; the API will not carry WAV.
+- **The carrier drops MP3.** Confirmed both through this Worker and by sending the same file by hand from the VoIP.ms portal to the same handset.
 
-Those last two pull in opposite directions, so the Worker prepares the recording in both formats, stores both, and offers them to `sendMMS` in order — WAV first, MP3 second — delivering the first one VoIP.ms accepts. The logs name the winner (`mms_success` carries `format`), and a rejected candidate is logged as `mms_candidate_rejected` with the API's reason.
+Those two leave no overlap, and the MP3 case is the worse of the pair: `sendMMS` reports success, so no fallback fires and nothing arrives. The default is therefore **WAV only** — when VoIP.ms refuses it the Worker sends an SMS carrying a link that actually plays.
 
-Set `MMS_MEDIA_FORMATS` to change or narrow the order (`wav,mp3`, `mp3,wav`, `mp3`, `wav`) without a code change.
+Set `MMS_MEDIA_FORMATS` to change the set and order (`wav`, `mp3`, `wav,mp3`, `mp3,wav`). The Worker offers each in turn and delivers the first VoIP.ms accepts; `mms_success` names the winning format and a refusal is logged as `mms_candidate_rejected` with the API's reason.
+
+### Finding a format that works
+
+`GET /diagnostics/media-probe?key=<PROBE_KEY or RECORDING_LINK_SECRET>` sends one short test MMS per encoding and reports which ones `sendMMS` accepts, so the API's verdict on a whole set is known in one request instead of one voicemail at a time. Variants: `wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`. Narrow the set with `&variants=a,b` and set clip length with `&seconds=`.
+
+These are real, billable messages to `MMS_DESTINATION`, so the endpoint 404s without the key and never runs on its own. Anything the API accepts still has to survive the carrier — check which numbered probes actually arrive.
 
 WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
 
@@ -39,7 +45,7 @@ Configure these in **Workers & Pages → voicemail-to-mms → Settings → Varia
 | `MMS_DESTINATION` | Text | Phone number that receives the voicemail MMS |
 | `PUBLIC_BASE_URL` | Text | Public URL of this Worker, no trailing slash. VoIP.ms fetches the recording from here. |
 
-An R2 bucket bound as `VOICEMAIL_BUCKET` is also required: it stores the MP3 that VoIP.ms downloads.
+An R2 bucket bound as `VOICEMAIL_BUCKET` is also required: it stores the recording that VoIP.ms downloads.
 
 No credentials or phone numbers are committed to GitHub.
 
@@ -50,7 +56,8 @@ No credentials or phone numbers are committed to GitHub.
 | `TIME_ZONE` | Notification time zone. Defaults to `America/New_York`. |
 | `CONTACTS_JSON` | Optional JSON phone-to-name map, e.g. `{"8455551212":"John Smith"}`. A matching contact name overrides Caller ID name from the voicemail email. |
 | `ALLOWED_SENDER_DOMAINS` | Comma-separated sender domains. Defaults to `voip.ms,voipinterface.net`. |
-| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav,mp3`. |
+| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav`. |
+| `PROBE_KEY` | Key for `/diagnostics/media-probe`. Falls back to `RECORDING_LINK_SECRET`; the probe is disabled when neither is set. |
 
 ## Message format
 
@@ -77,11 +84,12 @@ Fallback texts always keep the link intact - the caller/time prefix is shortened
 
 The R2 bucket bound as `VOICEMAIL_BUCKET` holds three things:
 
-- `voicemails/<yyyy>/<mm>/<dd>/...` - the delivered MP3, which doubles as the MMS media VoIP.ms downloads.
+- `voicemails/<yyyy>/<mm>/<dd>/...` - the prepared recording, which doubles as the MMS media VoIP.ms downloads.
+- `probes/...` - test clips from `/diagnostics/media-probe`.
 - `links/<token>` - a pointer that maps a 128-bit random token to a recording and an expiry.
 - `events/<id>.json` - a processed-event marker so duplicate email delivery does not generate duplicate texts.
 
-Recording URLs look like `https://<worker-host>/r/<token>.mp3`. The token is the secret, which keeps the URL short enough to survive inside a 160-character SMS fallback; the previous long signed URL was cut off mid-link and unusable.
+Recording URLs look like `https://<worker-host>/r/<token>`, which renders a small player page naming the caller and time. The same token plus the file extension (`/r/<token>.wav`) serves the audio itself, and that is what VoIP.ms fetches as MMS media. The token is the secret, which keeps the URL short enough to survive inside a 160-character SMS fallback; the previous long signed URL was cut off mid-link and unusable.
 
 Optional:
 
