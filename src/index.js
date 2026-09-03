@@ -110,7 +110,7 @@ export default {
     try {
       logEvent("mms_attempt", eventId, {
         ...audioDetails,
-        transport: archive?.url ? "rest_get_media_url" : "post_or_bearer_fallback",
+        transport: "rest_post_base64",
         mediaUrlConfigured: Boolean(archive?.url),
       });
       const result = await sendMms(env, notificationText, audioBytes, audio, archive?.url);
@@ -143,7 +143,7 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        outboundTransport: "VoIP.ms REST GET primary; R2 signed media URL for MMS",
+        outboundTransport: "VoIP.ms REST POST base64 primary; R2 media URL fallback",
       });
     }
 
@@ -156,45 +156,38 @@ export default {
 };
 
 async function sendMms(env, message, audioBytes, attachment, mediaUrl) {
-  // Primary path: use VoIP.ms's documented REST GET support and give VoIP.ms
-  // the signed R2 URL in media1. The recipient still receives an MMS with the
-  // MP3 attached; the URL is only used server-to-server by VoIP.ms to fetch it.
-  if (mediaUrl) {
-    const result = await callVoipMsGet(env, "sendMMS", {
+  // Send the recording bytes directly to VoIP.ms first. Their remote-media
+  // validator was returning invalid_media for WAV URLs even though the same
+  // WAV format works when uploaded directly in the VoIP.ms portal.
+  const detectedMimeType = mimeFromAttachment(attachment);
+  const mimeType = detectedMimeType === "audio/x-wav" ? "audio/wav" : detectedMimeType;
+  const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
+
+  try {
+    const result = await callVoipMsPost(env, "sendMMS", {
       did: normalizePhone(env.VOIPMS_DID),
       dst: normalizePhone(env.MMS_DESTINATION),
       message,
-      media1: mediaUrl,
+      media2: dataUrl,
     });
-    return { ...result, transport: "rest_get_media_url" };
-  }
+    return { ...result, transport: "rest_post_base64" };
+  } catch (postError) {
+    // Keep the signed R2 URL only as a secondary compatibility path. This is
+    // useful if direct POST is temporarily blocked again at the provider edge.
+    if (!mediaUrl) throw postError;
 
-  // If R2/private media URLs are unavailable, keep the prior transports as
-  // fallbacks. They are not the preferred production path because VoIP.ms's
-  // edge was observed blocking POST traffic from Cloudflare Workers.
-  if (env.VOIPMS_BEARER_TOKEN) {
     try {
-      const result = await callVoipMsBearer(env, {
-        from: toE164(env.VOIPMS_DID),
-        to: toE164(env.MMS_DESTINATION),
-        subject: "Voicemail",
-        text: truncateForSms(message, 160),
+      const result = await callVoipMsGet(env, "sendMMS", {
+        did: normalizePhone(env.VOIPMS_DID),
+        dst: normalizePhone(env.MMS_DESTINATION),
+        message,
+        media1: mediaUrl,
       });
-      return { ...result, mms: result.mms || result.sms || result.id || result.message_id || "", transport: "bearer_post_no_media" };
-    } catch (error) {
-      console.warn(`Bearer fallback failed: ${safeError(error)}`);
+      return { ...result, transport: "rest_get_media_url_fallback" };
+    } catch (getError) {
+      throw new Error(`VoIP.ms direct-media POST failed: ${safeError(postError)}; media-URL GET fallback failed: ${safeError(getError)}`);
     }
   }
-
-  const mimeType = mimeFromAttachment(attachment);
-  const dataUrl = `data:${mimeType};base64,${bytesToBase64(audioBytes)}`;
-  const result = await callVoipMsPost(env, "sendMMS", {
-    did: normalizePhone(env.VOIPMS_DID),
-    dst: normalizePhone(env.MMS_DESTINATION),
-    message,
-    media2: dataUrl,
-  });
-  return { ...result, transport: "rest_post_base64" };
 }
 
 async function sendFallbackSms(env, message) {
