@@ -10,7 +10,7 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 4. Cloudflare routes the email to this Worker.
 5. The Worker validates that the sender is from `voip.ms` or `voipinterface.net`, parses the voicemail email, extracts caller information and time, and finds the audio attachment.
 6. The Worker re-encodes the recording into the configured media formats, stores them in R2, and publishes a short unguessable URL for each.
-7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message and `media1` set to a recording URL, which VoIP.ms fetches to build the MMS. If VoIP.ms refuses one format the next is offered.
+7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message, uploading the recording as a multipart file part. If VoIP.ms refuses it, the next transport and format pair is offered.
 8. If MMS cannot be sent, the Worker sends a normal SMS fallback carrying the same listening link so the voicemail is not silently missed.
 
 ## How the media is delivered
@@ -18,16 +18,24 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 Three behaviours drive the delivery path, all observed against the live API and a real handset:
 
 - **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted. R2 plus `PUBLIC_BASE_URL` are therefore required, not optional.
-- **`sendMMS` refuses WAV** with `invalid_media`. Confirmed across five encodings: a media URL, base64, multipart, a `data:` URL, and a canonical mono 16-bit PCM file served from a clean extension-terminated URL with a content length and HEAD support. The URL shape is not the cause; the API will not carry WAV.
-- **The carrier drops MP3.** Confirmed both through this Worker and by sending the same file by hand from the VoIP.ms portal to the same handset.
+- **The recording is not the problem.** The exact WAV this Worker produces was downloaded from its own link and uploaded by hand through the VoIP.ms portal; that message arrived and played on the handset. Canonical mono 16-bit PCM at 8 kHz, 44-byte header.
+- **The carrier drops MP3.** Confirmed both through this Worker and by sending an MP3 by hand from the portal to the same handset. MP3 is the worse failure of the two, because `sendMMS` reports success, no fallback fires, and nothing arrives.
+- **`sendMMS` refuses those same WAV bytes when they are passed as a URL** (`invalid_media`) or as a base64 string. The URL shape is not the cause — a clean extension-terminated URL with a content length and HEAD support is refused identically.
 
-Those two leave no overlap, and the MP3 case is the worse of the pair: `sendMMS` reports success, so no fallback fires and nothing arrives. The default is therefore **WAV only** — when VoIP.ms refuses it the Worker sends an SMS carrying a link that actually plays.
+The portal *uploads* the recording; every earlier attempt here only ever handed the API a string. So the Worker now sends `media1` as a genuine multipart file part — Blob, filename and content type, the way a browser form uploads — and falls back to the URL transport if that is refused.
 
-Set `MMS_MEDIA_FORMATS` to change the set and order (`wav`, `mp3`, `wav,mp3`, `mp3,wav`). The Worker offers each in turn and delivers the first VoIP.ms accepts; `mms_success` names the winning format and a refusal is logged as `mms_candidate_rejected` with the API's reason.
+Two knobs control the attempt order, and the Worker tries every format over every transport before giving up:
+
+- `MMS_MEDIA_FORMATS` - `wav` (default), `mp3`, `wav,mp3`, `mp3,wav`
+- `MMS_TRANSPORTS` - `multipart_file,get_url` (default), plus `multipart_url` and `post_url`
+
+`mms_success` names the winning format and transport; each refusal is logged as `mms_candidate_rejected` with the API's own reason.
 
 ### Finding a format that works
 
-`GET /diagnostics/media-probe?key=<PROBE_KEY or RECORDING_LINK_SECRET>` sends one short test MMS per encoding and reports which ones `sendMMS` accepts, so the API's verdict on a whole set is known in one request instead of one voicemail at a time. Variants: `wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`. Narrow the set with `&variants=a,b` and set clip length with `&seconds=`.
+`GET /diagnostics/media-probe?key=<PROBE_KEY or RECORDING_LINK_SECRET>` sends one short test MMS per format/transport pair and reports which ones `sendMMS` accepts, so the API's verdict on a whole set is known in one request instead of one voicemail at a time.
+
+It defaults to one 8 kHz PCM WAV across every transport, since the format question is settled and the transport question is not. Widen it with `&variants=` (`wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`), narrow it with `&transports=`, and set clip length with `&seconds=`.
 
 These are real, billable messages to `MMS_DESTINATION`, so the endpoint 404s without the key and never runs on its own. Anything the API accepts still has to survive the carrier — check which numbered probes actually arrive.
 
@@ -57,6 +65,7 @@ No credentials or phone numbers are committed to GitHub.
 | `CONTACTS_JSON` | Optional JSON phone-to-name map, e.g. `{"8455551212":"John Smith"}`. A matching contact name overrides Caller ID name from the voicemail email. |
 | `ALLOWED_SENDER_DOMAINS` | Comma-separated sender domains. Defaults to `voip.ms,voipinterface.net`. |
 | `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav`. |
+| `MMS_TRANSPORTS` | Ordered `sendMMS` transports. Defaults to `multipart_file,get_url`. |
 | `PROBE_KEY` | Key for `/diagnostics/media-probe`. Falls back to `RECORDING_LINK_SECRET`; the probe is disabled when neither is set. |
 
 ## Message format
@@ -73,7 +82,7 @@ The recording is attached as the MMS media.
 - Audio too large for MMS after transcoding: send an SMS with a listening link.
 - Recording in a format the Worker cannot transcode (for example GSM 6.10 `wav49`): archive it as-is and send an SMS with a listening link.
 - Every media format rejected by VoIP.ms: send an SMS with a listening link.
-- No fetchable media URL configured: send an SMS naming that as the reason.
+- No fetchable media URL configured and only URL transports enabled: send an SMS naming that as the reason. The file-upload transport needs no hosting and is still attempted.
 - VoIP.ms MMS failure: send an SMS with a listening link.
 - Temporary VoIP.ms/API rate errors: retry with short exponential backoff.
 - Unexpected sender domains: reject the incoming email so the public voicemail address cannot easily be abused as an MMS relay.

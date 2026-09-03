@@ -138,16 +138,35 @@ function makeMessage(raw) {
   };
 }
 
-/** Run the email handler with console noise suppressed and VoIP.ms stubbed out. */
+/**
+ * Run the email handler with console noise suppressed and VoIP.ms stubbed out.
+ *
+ * Requests reach the API either as a query string or as a multipart body, so
+ * each captured call exposes `get(field)` over whichever it used and `file`
+ * for a media part sent as a real upload.
+ */
 async function runEmail(env, raw, respond) {
   const calls = [];
   const originalFetch = globalThis.fetch;
   const quiet = { log: console.log, warn: console.warn, error: console.error };
   console.log = console.warn = console.error = () => {};
+
   globalThis.fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input.url);
-    calls.push({ url, method: init?.method || "GET" });
-    return respond(url, init, calls.length);
+    const form = init?.body instanceof FormData ? init.body : null;
+    const media = form?.get("media1");
+    const call = {
+      url,
+      method: init?.method || "GET",
+      multipart: Boolean(form),
+      file: media instanceof Blob ? media : null,
+      get: (field) => {
+        const value = form ? form.get(field) : url.searchParams.get(field);
+        return typeof value === "string" ? value : null;
+      },
+    };
+    calls.push(call);
+    return respond(call, init, calls.length);
   };
 
   try {
@@ -163,61 +182,75 @@ async function runEmail(env, raw, respond) {
 const okMms = () => new Response(JSON.stringify({ status: "success", mms: 10208872 }), { status: 200 });
 const okSms = () => new Response(JSON.stringify({ status: "success", sms: 10208873 }), { status: 200 });
 
-test("sends the voicemail as an MMS whose media1 is a fetchable WAV URL", async () => {
+test("uploads the WAV as a real multipart file part, the way the portal does", async () => {
   const env = makeEnv();
-  const raw = buildVoicemailEmail(buildWav(3));
-  const calls = await runEmail(env, raw, okMms);
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(3)), okMms);
 
   assert.equal(calls.length, 1, "one VoIP.ms call, no SMS fallback");
-  const params = calls[0].url.searchParams;
-  assert.equal(params.get("method"), "sendMMS");
-  assert.equal(params.get("did"), DID);
-  assert.equal(params.get("dst"), DESTINATION);
-  assert.match(params.get("message"), /^Voicemail from 914-555-0100 - Sep 2, 2026, 9:06 PM$/);
+  const [call] = calls;
+  assert.equal(call.method, "POST");
+  assert.ok(call.multipart, "the recording should be uploaded, not linked");
+  assert.equal(call.get("method"), "sendMMS");
+  assert.equal(call.get("did"), DID);
+  assert.equal(call.get("dst"), DESTINATION);
+  assert.match(call.get("message"), /^Voicemail from 914-555-0100 - Sep 2, 2026, 9:06 PM$/);
 
-  // The media must be a URL VoIP.ms can fetch. Inline base64/data: media is
-  // accepted by the API but delivered as a zero-byte attachment.
-  const media = params.get("media1");
-  assert.ok(media.startsWith("https://"), `media1 should be an https URL, got ${media.slice(0, 40)}`);
-  assert.ok(!media.startsWith("data:"), "media1 must not be a data URL");
-  assert.match(media, /\/r\/[A-Za-z0-9_-]{22}\.wav$/, "WAV is offered first, being what the handset plays");
+  // media1 must be an actual file part: the same bytes the portal accepted,
+  // carried with a filename and content type rather than as a string.
+  assert.ok(call.file, "media1 should be a file part");
+  assert.equal(call.file.type, "audio/wav");
+  assert.equal(call.file.name, "voicemail.wav");
+  const uploaded = new Uint8Array(await call.file.arrayBuffer());
+  assert.ok(isRiffWave(uploaded), "uploaded bytes should be a WAV");
 
   const [key] = [...env.VOICEMAIL_BUCKET.store.keys()].filter((name) => name.endsWith(".wav"));
   const stored = env.VOICEMAIL_BUCKET.store.get(key);
-  assert.ok(isRiffWave(stored.bytes), "archived recording should be WAV");
-  assert.ok(stored.bytes.byteLength > 1000, "archived recording should not be empty");
+  assert.deepEqual(uploaded, stored.bytes, "the upload should be the archived recording");
   assert.equal(stored.httpMetadata.contentType, "audio/wav");
 });
 
-test("falls back to the MP3 candidate when VoIP.ms rejects the WAV", async () => {
-  const env = makeEnv({ MMS_MEDIA_FORMATS: "wav,mp3" });
-  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (url) =>
-    /\.wav$/.test(url.searchParams.get("media1") || "")
-      ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
+test("falls back to the media URL when the file upload is refused", async () => {
+  const env = makeEnv();
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (call) =>
+    call.multipart
+      ? new Response(JSON.stringify({ status: "invalid_file" }), { status: 200 })
       : okMms());
 
-  assert.equal(calls.length, 2, "WAV attempted, then MP3");
-  assert.match(calls[0].url.searchParams.get("media1"), /\.wav$/);
-  assert.match(calls[1].url.searchParams.get("media1"), /\.mp3$/);
-  assert.equal(calls[1].url.searchParams.get("method"), "sendMMS");
-
-  const played = await worker.fetch(new Request(calls[1].url.searchParams.get("media1")), env);
-  assert.equal(played.headers.get("content-type"), "audio/mpeg");
-  assert.ok(isMp3(new Uint8Array(await played.arrayBuffer())));
+  assert.equal(calls.length, 2, "file upload attempted, then the URL transport");
+  assert.ok(calls[0].multipart);
+  assert.equal(calls[1].method, "GET");
+  assert.match(calls[1].get("media1"), /\/r\/[A-Za-z0-9_-]{22}\.wav$/);
 });
 
-test("honours MMS_MEDIA_FORMATS to force a single format", async () => {
-  const env = makeEnv({ MMS_MEDIA_FORMATS: "mp3" });
+test("honours MMS_TRANSPORTS and MMS_MEDIA_FORMATS", async () => {
+  const env = makeEnv({ MMS_TRANSPORTS: "get_url", MMS_MEDIA_FORMATS: "mp3" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
 
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url.searchParams.get("media1"), /\.mp3$/);
+  assert.equal(calls[0].method, "GET");
+  assert.match(calls[0].get("media1"), /\.mp3$/);
+});
+
+test("tries every format over every transport before giving up", async () => {
+  const env = makeEnv({ MMS_TRANSPORTS: "multipart_file,get_url", MMS_MEDIA_FORMATS: "wav,mp3" });
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (call) =>
+    call.get("method") === "sendMMS"
+      ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
+      : okSms());
+
+  assert.deepEqual(
+    calls.slice(0, 4).map((c) => `${c.multipart ? "file" : "url"}:${c.file ? c.file.type : ""}`),
+    ["file:audio/wav", "url:", "file:audio/mpeg", "url:"],
+  );
+  assert.equal(calls[4].get("method"), "sendSMS", "SMS fallback after all four are refused");
 });
 
 test("serves the signed recording URL with an audio content type and length", async () => {
   const env = makeEnv();
+  const env2 = makeEnv({ MMS_TRANSPORTS: "get_url" });
+  Object.assign(env, env2, { VOICEMAIL_BUCKET: env.VOICEMAIL_BUCKET });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
-  const mediaUrl = calls[0].url.searchParams.get("media1");
+  const mediaUrl = calls[0].get("media1");
 
   const get = await worker.fetch(new Request(mediaUrl), env);
   assert.equal(get.status, 200);
@@ -249,22 +282,21 @@ test("passes an MP3 attachment through without re-encoding", async () => {
   const calls = await runEmail(env, raw, okMms);
 
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url.searchParams.get("media1"), /\/r\/[A-Za-z0-9_-]{22}\.mp3$/);
   const [key] = [...env.VOICEMAIL_BUCKET.store.keys()].filter((name) => name.startsWith("voicemails/"));
   assert.deepEqual(env.VOICEMAIL_BUCKET.store.get(key).bytes, mp3);
+  assert.deepEqual(new Uint8Array(await calls[0].file.arrayBuffer()), mp3, "MP3 uploaded untouched");
 });
 
 test("falls back to SMS with a listening link when VoIP.ms rejects the MMS", async () => {
   const env = makeEnv();
   const raw = buildVoicemailEmail(buildWav(2));
-  const calls = await runEmail(env, raw, (url) =>
-    url.searchParams.get("method") === "sendMMS"
+  const calls = await runEmail(env, raw, (call) =>
+    call.get("method") === "sendMMS"
       ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
       : okSms());
 
-  assert.equal(calls.length, 2, "the WAV candidate, then SMS");
-  assert.equal(calls[1].url.searchParams.get("method"), "sendSMS");
-  const text = calls[1].url.searchParams.get("message");
+  assert.equal(calls.at(-1).get("method"), "sendSMS");
+  const text = calls.at(-1).get("message");
   assert.ok(text.length <= 160, `SMS must fit one segment, got ${text.length}`);
 
   // A link cut short by the 160-character limit is useless, so assert the URL
@@ -282,15 +314,24 @@ test("falls back to SMS with a listening link when VoIP.ms rejects the MMS", asy
   assert.ok(isRiffWave(new Uint8Array(await audio.arrayBuffer())));
 });
 
-test("falls back to SMS when no fetchable media URL can be produced", async () => {
+test("uploads the recording even with no public media URL configured", async () => {
+  // The file transport carries the bytes itself, so hosting is not required.
   const env = makeEnv({ PUBLIC_BASE_URL: "" });
-  const raw = buildVoicemailEmail(buildWav(2));
-  const calls = await runEmail(env, raw, okSms);
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url.searchParams.get("method"), "sendSMS");
-  assert.match(calls[0].url.searchParams.get("message"), /MMS media hosting is not configured/);
-  assert.ok(calls[0].url.searchParams.get("message").length <= 160);
+  assert.equal(calls[0].get("method"), "sendMMS");
+  assert.ok(calls[0].file, "the recording should still be uploaded");
+});
+
+test("falls back to SMS when a URL-only transport has no media URL", async () => {
+  const env = makeEnv({ PUBLIC_BASE_URL: "", MMS_TRANSPORTS: "get_url" });
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okSms);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].get("method"), "sendSMS");
+  assert.match(calls[0].get("message"), /MMS media hosting is not configured/);
+  assert.ok(calls[0].get("message").length <= 160);
 });
 
 test("falls back to SMS when the attachment cannot be transcoded", async () => {
@@ -300,11 +341,11 @@ test("falls back to SMS when the attachment cannot be transcoded", async () => {
   const calls = await runEmail(env, buildVoicemailEmail(gsm), okSms);
 
   assert.equal(calls.length, 1, "no MMS attempt for media VoIP.ms would reject");
-  assert.equal(calls[0].url.searchParams.get("method"), "sendSMS");
+  assert.equal(calls[0].get("method"), "sendSMS");
 
   // The original recording is still archived, so the SMS carries a link to it
   // rather than only telling the user to dial voicemail.
-  const text = calls[0].url.searchParams.get("message");
+  const text = calls[0].get("message");
   assert.ok(text.length <= 160, `SMS must fit one segment, got ${text.length}`);
   const [, link] = text.match(/Listen: (\S+)$/) || [];
   assert.ok(link, `expected an untruncated link in ${text}`);
@@ -326,5 +367,6 @@ test("health endpoint reports the media-URL transport", async () => {
   assert.equal(body.mmsMediaReady, true);
   assert.deepEqual(body.mmsMediaMissingBindings, []);
   assert.deepEqual(body.mmsMediaFormats, ["wav"]);
-  assert.match(body.outboundTransport, /first accepted format wins/);
+  assert.deepEqual(body.mmsTransports, ["multipart_file", "get_url"]);
+  assert.match(body.outboundTransport, /first accepted format\/transport pair wins/);
 });

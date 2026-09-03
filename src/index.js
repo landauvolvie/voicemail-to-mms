@@ -1,6 +1,6 @@
 import PostalMime from "postal-mime";
 import { DEFAULT_MMS_FORMATS, buildMmsCandidates, parseMmsFormats } from "./audio.js";
-import { PROBE_VARIANTS, buildProbeMedia, parseProbeVariants } from "./probe.js";
+import { buildProbeMedia, parseProbeVariants } from "./probe.js";
 import {
   MAX_MMS_AUDIO_BYTES,
   buildFallbackText,
@@ -25,7 +25,10 @@ const VOIPMS_3CX_ENDPOINT = "https://voip.ms/api/3cx/msg";
 const MAX_EMAIL_BYTES = 12 * 1024 * 1024;
 const REQUIRED_BINDINGS = ["VOIPMS_API_USERNAME", "VOIPMS_API_PASSWORD", "VOIPMS_DID", "MMS_DESTINATION"];
 const MEDIA_URL_BINDINGS = ["VOICEMAIL_BUCKET", "PUBLIC_BASE_URL"];
-const MMS_TRANSPORT = "rest_get_media_url";
+// The portal uploads the recording as a file, so that transport goes first;
+// the URL transport is what the API has been refusing for WAV.
+const MMS_TRANSPORTS = ["multipart_file", "multipart_url", "post_url", "get_url"];
+const DEFAULT_MMS_TRANSPORTS = ["multipart_file", "get_url"];
 const RECORDING_PREFIX = "voicemails/";
 const LINK_PREFIX = "links/";
 const PROBE_PREFIX = "probes/";
@@ -95,9 +98,9 @@ export default {
       audioFilename: String(audio.filename || "").slice(0, 160),
     });
 
-    // WAV is what the receiving handset plays, but VoIP.ms has rejected WAV
-    // media with `invalid_media`; MP3 is the reverse. Offer each in turn and
-    // deliver the first one VoIP.ms accepts.
+    // The recording itself is known good — these exact bytes were uploaded by
+    // hand through the VoIP.ms portal and arrived playable. Only the API path
+    // refuses them, so each format is offered over each transport in turn.
     const prepared = prepareCandidates(eventId, audio, sourceBytes, env);
     const stored = await archiveCandidatesIfConfigured(env, {
       eventId,
@@ -118,23 +121,28 @@ export default {
       return;
     }
 
+    const transports = parseMmsTransports(env.MMS_TRANSPORTS);
     const failures = [];
     for (const candidate of stored) {
       const details = { format: candidate.format, mediaType: candidate.mimeType, mediaSize: candidate.bytes.byteLength };
-      try {
-        logEvent("mms_attempt", eventId, { ...details, transport: MMS_TRANSPORT });
-        const result = await sendMms(env, notificationText, candidate.url);
-        logEvent("mms_success", eventId, {
-          ...details,
-          messageId: result.mms || result.sms || "",
-          status: result.status || "success",
-          transport: result.transport || MMS_TRANSPORT,
-        });
-        await markProcessedIfConfigured(env, eventId, `mms_sent_${candidate.format}`);
-        return;
-      } catch (error) {
-        failures.push(`${candidate.format}: ${safeError(error)}`);
-        logEvent("mms_candidate_rejected", eventId, { ...details, error: safeError(error) }, "warn");
+      for (const transport of transports) {
+        // A URL transport needs a published URL; a file transport does not.
+        if (transport !== "multipart_file" && !candidate.url) continue;
+        try {
+          logEvent("mms_attempt", eventId, { ...details, transport });
+          const result = await sendMmsVia(env, transport, notificationText, candidate);
+          logEvent("mms_success", eventId, {
+            ...details,
+            transport,
+            messageId: result.mms || result.sms || "",
+            status: result.status || "success",
+          });
+          await markProcessedIfConfigured(env, eventId, `mms_sent_${candidate.format}_${transport}`);
+          return;
+        } catch (error) {
+          failures.push(`${candidate.format}/${transport}: ${safeError(error)}`);
+          logEvent("mms_candidate_rejected", eventId, { ...details, transport, error: safeError(error) }, "warn");
+        }
       }
     }
 
@@ -157,13 +165,13 @@ export default {
         privateLinksConfigured: Boolean(env.VOICEMAIL_BUCKET && env.RECORDING_LINK_SECRET),
         requiredBindings: Object.fromEntries(REQUIRED_BINDINGS.map((name) => [name, Boolean(env[name])])),
         maxMmsAudioBytes: MAX_MMS_AUDIO_BYTES,
-        // MMS media must be a URL VoIP.ms can fetch; inline base64 media is
-        // accepted by the API but delivered as a zero-byte attachment.
         mmsMediaReady: mediaUrlMissing.length === 0,
         mmsMediaMissingBindings: mediaUrlMissing,
         mmsMediaFormats: parseMmsFormats(env.MMS_MEDIA_FORMATS),
         defaultMmsMediaFormats: DEFAULT_MMS_FORMATS,
-        outboundTransport: "VoIP.ms sendMMS GET with media1 = recording URL, first accepted format wins",
+        mmsTransports: parseMmsTransports(env.MMS_TRANSPORTS),
+        availableMmsTransports: MMS_TRANSPORTS,
+        outboundTransport: "VoIP.ms sendMMS, first accepted format/transport pair wins",
       });
     }
 
@@ -215,24 +223,66 @@ function prepareCandidates(eventId, attachment, sourceBytes, env) {
 
 function undeliverableReason(env, prepared, stored) {
   if (!prepared.candidates.length) return prepared.reason || "unsupported_audio";
-  // VoIP.ms only renders MMS media it can fetch for itself. Inline media
-  // (base64 or a data: URL) is accepted by sendMMS and reports status
-  // "success", but the delivered message carries a zero-byte attachment, so a
-  // publicly reachable recording URL is required for a real MMS.
-  if (!stored.some((candidate) => candidate.url)) {
+  // The URL transports need a published recording URL; the multipart file
+  // transport carries the bytes itself, so it works without one.
+  const transports = parseMmsTransports(env.MMS_TRANSPORTS);
+  if (!transports.includes("multipart_file") && !stored.some((candidate) => candidate.url)) {
     return missingBindings(env, MEDIA_URL_BINDINGS).length ? "media_url_unconfigured" : "media_url_unavailable";
   }
   return "";
 }
 
-async function sendMms(env, message, mediaUrl) {
-  const result = await callVoipMsGet(env, "sendMMS", {
+/**
+ * Send one MMS over a named transport.
+ *
+ * The recording itself is not the problem: the exact bytes this Worker
+ * produces were downloaded and uploaded by hand through the VoIP.ms portal,
+ * and that message arrived and played. Only the API path refuses them, and it
+ * refuses `media1` as a URL (`invalid_media`) or as a base64 string. What the
+ * portal does and the API had never been asked to do is take the recording as
+ * a real multipart file part, so that is tried first.
+ */
+async function sendMmsVia(env, transport, message, candidate) {
+  const params = {
     did: normalizePhone(env.VOIPMS_DID),
     dst: normalizePhone(env.MMS_DESTINATION),
     message,
-    media1: mediaUrl,
-  });
-  return { ...result, transport: MMS_TRANSPORT };
+  };
+  const filename = `voicemail.${candidate.extension}`;
+  const file = { bytes: candidate.bytes, contentType: candidate.mimeType, filename };
+
+  switch (transport) {
+    case "multipart_file":
+      return withTransport(await callVoipMsMultipart(env, "sendMMS", params, { media1: file }), transport);
+    case "multipart_url":
+      return withTransport(await callVoipMsMultipart(env, "sendMMS", { ...params, media1: candidate.url }), transport);
+    case "post_url":
+      return withTransport(await callVoipMsPost(env, "sendMMS", { ...params, media1: candidate.url }), transport);
+    case "get_url":
+      return withTransport(await callVoipMsGet(env, "sendMMS", { ...params, media1: candidate.url }), transport);
+    default:
+      throw new Error(`Unknown MMS transport: ${transport}`);
+  }
+}
+
+function withTransport(result, transport) {
+  return { ...result, transport };
+}
+
+function parseProbeTransports(value) {
+  const requested = String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => MMS_TRANSPORTS.includes(item));
+  return requested.length ? [...new Set(requested)] : MMS_TRANSPORTS;
+}
+
+export function parseMmsTransports(value) {
+  const requested = String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => MMS_TRANSPORTS.includes(item));
+  return requested.length ? [...new Set(requested)] : DEFAULT_MMS_TRANSPORTS;
 }
 
 async function sendFallbackSms(env, message) {
@@ -297,6 +347,91 @@ function toE164(value) {
   const digits = normalizePhone(value);
   if (digits.length === 10) return `+1${digits}`;
   return digits.startsWith("1") ? `+${digits}` : `+${digits}`;
+}
+
+/**
+ * POST to the REST API as multipart/form-data.
+ *
+ * `files` entries become genuine file parts — Blob plus filename plus content
+ * type — which is how a browser form uploads a recording. String fields alone
+ * were all this Worker ever sent before, and the API refused those.
+ */
+async function callVoipMsMultipart(env, method, params = {}, files = {}) {
+  return withVoipMsRetries(`${method} multipart POST`, async () => {
+    const form = new FormData();
+    form.set("api_username", env.VOIPMS_API_USERNAME);
+    form.set("api_password", env.VOIPMS_API_PASSWORD);
+    form.set("method", method);
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
+    }
+    for (const [key, file] of Object.entries(files)) {
+      form.set(key, new Blob([file.bytes], { type: file.contentType }), file.filename);
+    }
+
+    // No content-type header: fetch has to set it so the multipart boundary matches.
+    return fetch(VOIPMS_ENDPOINT, {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "cache-control": "no-cache",
+        "user-agent": "Mozilla/5.0 (compatible; voicemail-to-mms/1.0)",
+      },
+      body: form,
+    });
+  });
+}
+
+async function callVoipMsPost(env, method, params = {}) {
+  return withVoipMsRetries(`${method} POST`, async () => fetch(VOIPMS_ENDPOINT, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "cache-control": "no-cache",
+      "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "user-agent": "Mozilla/5.0 (compatible; voicemail-to-mms/1.0)",
+    },
+    body: buildVoipMsParams(env, method, params).toString(),
+  }));
+}
+
+/** Shared retry/parse wrapper so every transport reports failures the same way. */
+async function withVoipMsRetries(label, send) {
+  const maxAttempts = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await send();
+      const responseText = await response.text();
+      if (response.status === 403) {
+        throw new Error(describeVoipMsEdgeRejection(response, responseText, label));
+      }
+
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        const reason = extractSoapReason(responseText);
+        throw new Error(`VoIP.ms ${label} returned non-JSON (HTTP ${response.status})${reason ? `: ${reason}` : ""}`);
+      }
+
+      if (response.ok && data.status === "success") return data;
+
+      const status = String(data.status || `http_${response.status}`);
+      if (attempt < maxAttempts && isRetryableVoipStatus(status, response.status)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new Error(`VoIP.ms ${label} failed: ${status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableException(error)) break;
+      await sleep(backoffMs(attempt));
+    }
+  }
+
+  throw lastError || new Error(`VoIP.ms ${label} failed`);
 }
 
 async function callVoipMsGet(env, method, params = {}) {
@@ -479,33 +614,42 @@ async function runMediaProbe(request, env) {
   }
 
   const url = new URL(request.url);
-  const variants = parseProbeVariants(url.searchParams.get("variants"));
+  // The format question is settled — the recording plays once it arrives — so
+  // the probe defaults to one WAV across every transport instead.
+  const variants = parseProbeVariants(url.searchParams.get("variants") || "wav-8k-pcm16");
+  const transports = parseProbeTransports(url.searchParams.get("transports"));
   const seconds = clampInt(url.searchParams.get("seconds"), 1, 10, 2);
   const results = [];
+  let index = 0;
 
-  for (const [index, name] of variants.entries()) {
-    const label = `Probe ${index + 1}/${variants.length}: ${name}`;
-    try {
-      const media = buildProbeMedia(name, seconds);
-      const key = `probes/${Date.now()}-${name}.${media.extension}`;
-      await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
-        httpMetadata: { contentType: contentTypeForExtension(media.extension, media.mimeType) },
-      });
-      const { url: mediaUrl } = await publishRecordingLink(env, key);
-      const result = await sendMms(env, label, mediaUrl);
-      results.push({ variant: name, bytes: media.bytes.byteLength, accepted: true, messageId: result.mms || "", mediaUrl });
-      logEvent("probe_accepted", "media-probe", { variant: name, bytes: media.bytes.byteLength });
-    } catch (error) {
-      results.push({ variant: name, accepted: false, error: safeError(error) });
-      logEvent("probe_rejected", "media-probe", { variant: name, error: safeError(error) }, "warn");
+  for (const name of variants) {
+    const media = buildProbeMedia(name, seconds);
+    const key = `${PROBE_PREFIX}${Date.now()}-${name}.${media.extension}`;
+    await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
+      httpMetadata: { contentType: contentTypeForExtension(media.extension, media.mimeType) },
+    });
+    const published = await publishRecordingLink(env, key);
+    const candidate = { ...media, ...published };
+
+    for (const transport of transports) {
+      index += 1;
+      const label = `Probe ${index}: ${name} via ${transport}`;
+      try {
+        const result = await sendMmsVia(env, transport, label, candidate);
+        results.push({ probe: index, variant: name, transport, bytes: media.bytes.byteLength, accepted: true, messageId: result.mms || "" });
+        logEvent("probe_accepted", "media-probe", { variant: name, transport });
+      } catch (error) {
+        results.push({ probe: index, variant: name, transport, accepted: false, error: safeError(error) });
+        logEvent("probe_rejected", "media-probe", { variant: name, transport, error: safeError(error) }, "warn");
+      }
     }
   }
 
   return Response.json({
     ok: true,
-    note: "Each accepted variant was sent as a real MMS. Check which of the numbered probes actually arrive on the handset.",
-    accepted: results.filter((r) => r.accepted).map((r) => r.variant),
-    rejected: results.filter((r) => !r.accepted).map((r) => r.variant),
+    note: "Each accepted probe was sent as a real MMS. Check which numbered probes actually arrive and play on the handset.",
+    accepted: results.filter((r) => r.accepted).map((r) => `${r.probe}: ${r.variant} via ${r.transport}`),
+    rejected: results.filter((r) => !r.accepted).map((r) => `${r.probe}: ${r.variant} via ${r.transport}`),
     results,
   });
 }
