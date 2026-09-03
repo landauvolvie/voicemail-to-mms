@@ -1,13 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  MAX_WAV_MMS_BYTES,
   MP3_MIME_TYPE,
+  WAV_MIME_TYPE,
+  buildMmsCandidates,
   chooseMp3SampleRate,
   decodeWavToMonoPcm16,
   isMp3,
   isRiffWave,
+  parseMmsFormats,
   parseWav,
-  prepareMmsAudio,
   resamplePcm16,
   transcodeWavToMp3,
 } from "../src/audio.js";
@@ -189,22 +192,51 @@ test("transcodes an 8 kHz WAV voicemail into a decodable MP3", () => {
   assert.ok(Math.abs(mp3.durationSeconds - 3) < 0.2, `unexpected duration ${mp3.durationSeconds}`);
 });
 
-test("prepareMmsAudio converts WAV and passes MP3 through", () => {
-  const wav = prepareMmsAudio(buildWav(tone(1)));
-  assert.equal(wav.transcoded, true);
-  assert.equal(wav.deliverable, true);
-  assert.equal(wav.mimeType, MP3_MIME_TYPE);
-  assert.equal(wav.extension, "mp3");
-  assert.ok(wav.bytes.byteLength < wav.sourceBytes, "MP3 should be smaller than 16-bit PCM");
+test("offers WAV before MP3 so the handset-playable format is tried first", () => {
+  const { candidates, durationSeconds } = buildMmsCandidates(buildWav(tone(2)));
 
-  const alreadyMp3 = prepareMmsAudio(wav.bytes);
-  assert.equal(alreadyMp3.transcoded, false);
-  assert.equal(alreadyMp3.deliverable, true);
-  assert.equal(alreadyMp3.bytes, wav.bytes);
+  assert.deepEqual(candidates.map((c) => c.format), ["wav", "mp3"]);
+  assert.equal(durationSeconds, 2);
+
+  const [wav, mp3] = candidates;
+  assert.equal(wav.mimeType, WAV_MIME_TYPE);
+  assert.equal(wav.extension, "wav");
+  assert.ok(isRiffWave(wav.bytes), "first candidate should be a real WAV");
+  assert.equal(parseWav(wav.bytes).sampleRate, 8000, "WAV keeps the recorded rate");
+  assert.equal(parseWav(wav.bytes).channels, 1);
+
+  assert.equal(mp3.mimeType, MP3_MIME_TYPE);
+  assert.ok(isMp3(mp3.bytes));
+  assert.ok(mp3.bytes.byteLength < wav.bytes.byteLength, "MP3 should be the smaller candidate");
 });
 
-test("prepareMmsAudio flags containers it cannot deliver", () => {
-  const result = prepareMmsAudio(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04]));
-  assert.equal(result.deliverable, false);
+test("honours a configured format order", () => {
+  assert.deepEqual(parseMmsFormats("mp3,wav"), ["mp3", "wav"]);
+  assert.deepEqual(parseMmsFormats("MP3"), ["mp3"]);
+  assert.deepEqual(parseMmsFormats(""), ["wav", "mp3"]);
+  assert.deepEqual(parseMmsFormats("ogg,flac"), ["wav", "mp3"], "unknown formats fall back to the default");
+
+  const { candidates } = buildMmsCandidates(buildWav(tone(1)), parseMmsFormats("mp3"));
+  assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
+});
+
+test("drops the WAV candidate once it outgrows MMS", () => {
+  // 16-bit 8 kHz PCM is 16 KB/s, so this clip lands well past the WAV ceiling.
+  const seconds = MAX_WAV_MMS_BYTES / 16000 + 5;
+  const { candidates } = buildMmsCandidates(buildWav(tone(seconds)));
+  assert.deepEqual(candidates.map((c) => c.format), ["mp3"], "long recordings ship as MP3 only");
+});
+
+test("an MP3 attachment can only ship as MP3", () => {
+  const mp3 = buildMmsCandidates(buildWav(tone(1))).candidates.find((c) => c.format === "mp3").bytes;
+  const { candidates } = buildMmsCandidates(mp3);
+  assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
+  assert.equal(candidates[0].transcoded, false);
+  assert.equal(candidates[0].bytes, mp3);
+});
+
+test("flags containers it cannot deliver", () => {
+  const result = buildMmsCandidates(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04]));
+  assert.deepEqual(result.candidates, []);
   assert.equal(result.reason, "unrecognized_audio_container");
 });

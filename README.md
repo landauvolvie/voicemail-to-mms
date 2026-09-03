@@ -13,14 +13,19 @@ Cloudflare Email Worker that receives VoIP.ms voicemail notification emails, ext
 7. The Worker sends an MMS through the VoIP.ms `sendMMS` API with a short message and `media1` set to that URL, which VoIP.ms fetches to build the MMS.
 8. If MMS cannot be sent, the Worker sends a normal SMS fallback carrying the same listening link so the voicemail is not silently missed.
 
-## Why the recording is transcoded and never inlined
+## How the media is delivered
 
-Two VoIP.ms behaviours drive the delivery path, both confirmed against the live API:
+Three behaviours drive the delivery path, all observed against the live API and a real handset:
 
-- **`sendMMS` rejects WAV media** with `invalid_media`, even though WAV appears in the published list of permitted MMS attachments. MP3 is delivered normally, so every recording is converted to mono MP3 before it is sent. Asterisk voicemail writes 8 kHz audio; the Worker upsamples to 16 kHz so the MP3 is MPEG-2 Layer III rather than the less widely supported MPEG-2.5.
-- **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted.
+- **`sendMMS` only renders media it can fetch itself.** Passing the recording inline — base64 in `media1`/`media2`, or a `data:` URL — is accepted by the API and returns `status: success` with a message ID, but the message that arrives carries a **zero-byte, zero-second attachment**. Only a publicly reachable URL produces real audio, so `media1` is always a URL and inline media is never attempted. R2 plus `PUBLIC_BASE_URL` are therefore required, not optional.
+- **`sendMMS` has rejected WAV media** with `invalid_media` while accepting MP3.
+- **The receiving handset plays WAV but ignores MP3**, so an MP3 the API accepts can still arrive as a message with nothing to play.
 
-Because of the second point, R2 plus `PUBLIC_BASE_URL` are required for MMS delivery, not optional.
+Those last two pull in opposite directions, so the Worker prepares the recording in both formats, stores both, and offers them to `sendMMS` in order — WAV first, MP3 second — delivering the first one VoIP.ms accepts. The logs name the winner (`mms_success` carries `format`), and a rejected candidate is logged as `mms_candidate_rejected` with the API's reason.
+
+Set `MMS_MEDIA_FORMATS` to change or narrow the order (`wav,mp3`, `mp3,wav`, `mp3`, `wav`) without a code change.
+
+WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
 
 ## Required Cloudflare variables/secrets
 
@@ -45,6 +50,7 @@ No credentials or phone numbers are committed to GitHub.
 | `TIME_ZONE` | Notification time zone. Defaults to `America/New_York`. |
 | `CONTACTS_JSON` | Optional JSON phone-to-name map, e.g. `{"8455551212":"John Smith"}`. A matching contact name overrides Caller ID name from the voicemail email. |
 | `ALLOWED_SENDER_DOMAINS` | Comma-separated sender domains. Defaults to `voip.ms,voipinterface.net`. |
+| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav,mp3`. |
 
 ## Message format
 
@@ -59,6 +65,7 @@ The recording is attached as the MMS media.
 - Missing audio attachment: send an SMS telling the user to call voicemail.
 - Audio too large for MMS after transcoding: send an SMS with a listening link.
 - Recording in a format the Worker cannot transcode (for example GSM 6.10 `wav49`): archive it as-is and send an SMS with a listening link.
+- Every media format rejected by VoIP.ms: send an SMS with a listening link.
 - No fetchable media URL configured: send an SMS naming that as the reason.
 - VoIP.ms MMS failure: send an SMS with a listening link.
 - Temporary VoIP.ms/API rate errors: retry with short exponential backoff.
@@ -105,5 +112,5 @@ Cloudflare's Git integration deploys this Worker automatically on every push to 
 Tests cover three layers:
 
 - `test/core.test.js` - NANP normalization, caller-ID extraction, sender-domain validation, contact-name overrides.
-- `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes) and MP3 output, verified by walking real MP3 frame headers for sample rate, version and duration.
-- `test/worker.test.js` - the whole email handler against a stubbed VoIP.ms API and an in-memory R2, asserting that `media1` is a fetchable MP3 URL, that the URL serves `audio/mpeg` with a content length over GET and HEAD, and that every SMS fallback fits one segment with its link intact.
+- `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes), candidate ordering and size limits, and MP3 output verified by walking real MP3 frame headers for sample rate, version and duration.
+- `test/worker.test.js` - the whole email handler against a stubbed VoIP.ms API and an in-memory R2, asserting that `media1` is a fetchable URL rather than inline data, that a WAV rejection falls through to the MP3 candidate, that recording URLs serve the right content type and length over GET and HEAD, and that every SMS fallback fits one segment with its link intact.

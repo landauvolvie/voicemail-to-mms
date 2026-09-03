@@ -1,5 +1,5 @@
 import PostalMime from "postal-mime";
-import { MP3_BITRATE_KBPS, prepareMmsAudio } from "./audio.js";
+import { DEFAULT_MMS_FORMATS, buildMmsCandidates, parseMmsFormats } from "./audio.js";
 import {
   MAX_MMS_AUDIO_BYTES,
   buildFallbackText,
@@ -92,54 +92,55 @@ export default {
       audioFilename: String(audio.filename || "").slice(0, 160),
     });
 
-    // VoIP.ms rejects WAV media with `invalid_media`, so voicemail recordings
-    // are transcoded to MP3 (the format that is delivered successfully).
-    const media = transcodeForMms(eventId, audio, sourceBytes);
-    const mediaDetails = {
-      mediaType: media.mimeType,
-      mediaSize: media.bytes.byteLength,
-      sourceSize: media.sourceBytes,
-      transcoded: media.transcoded,
-      deliverable: media.deliverable,
-    };
-
-    const archive = await archiveVoicemailIfConfigured(env, {
+    // WAV is what the receiving handset plays, but VoIP.ms has rejected WAV
+    // media with `invalid_media`; MP3 is the reverse. Offer each in turn and
+    // deliver the first one VoIP.ms accepts.
+    const prepared = prepareCandidates(eventId, audio, sourceBytes, env);
+    const stored = await archiveCandidatesIfConfigured(env, {
       eventId,
-      media,
+      prepared,
       identity,
       voicemailDate,
     });
 
-    const reason = undeliverableReason(env, media, archive);
-    if (reason) {
-      const fallback = archive?.url
-        ? buildLinkFallbackText(notificationText, archive.url)
-        : buildFallbackText(notificationText, reason);
-      logEvent("fallback_attempt", eventId, { reason, transport: "rest_get", ...mediaDetails }, "warn");
+    const blocked = undeliverableReason(env, prepared, stored);
+    if (blocked) {
+      const fallback = stored[0]?.url
+        ? buildLinkFallbackText(notificationText, stored[0].url)
+        : buildFallbackText(notificationText, blocked);
+      logEvent("fallback_attempt", eventId, { reason: blocked, transport: "rest_get" }, "warn");
       const result = await sendFallbackSms(env, fallback);
-      logEvent("fallback_success", eventId, { reason, messageId: result.sms || "", transport: result.transport || "unknown" });
-      await markProcessedIfConfigured(env, eventId, `sms_${reason}`);
+      logEvent("fallback_success", eventId, { reason: blocked, messageId: result.sms || "", transport: result.transport || "unknown" });
+      await markProcessedIfConfigured(env, eventId, `sms_${blocked}`);
       return;
     }
 
-    try {
-      logEvent("mms_attempt", eventId, { ...mediaDetails, transport: MMS_TRANSPORT });
-      const result = await sendMms(env, notificationText, archive.url);
-      logEvent("mms_success", eventId, {
-        messageId: result.mms || result.sms || "",
-        status: result.status || "success",
-        transport: result.transport || MMS_TRANSPORT,
-        ...mediaDetails,
-      });
-      await markProcessedIfConfigured(env, eventId, "mms_sent");
-    } catch (error) {
-      logEvent("mms_failure", eventId, { error: safeError(error), ...mediaDetails }, "error");
-      const fallback = buildLinkFallbackText(notificationText, archive.url);
-      logEvent("fallback_attempt", eventId, { reason: "mms_failed", transport: "rest_get" }, "warn");
-      const result = await sendFallbackSms(env, fallback);
-      logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "", transport: result.transport || "unknown" });
-      await markProcessedIfConfigured(env, eventId, "sms_fallback");
+    const failures = [];
+    for (const candidate of stored) {
+      const details = { format: candidate.format, mediaType: candidate.mimeType, mediaSize: candidate.bytes.byteLength };
+      try {
+        logEvent("mms_attempt", eventId, { ...details, transport: MMS_TRANSPORT });
+        const result = await sendMms(env, notificationText, candidate.url);
+        logEvent("mms_success", eventId, {
+          ...details,
+          messageId: result.mms || result.sms || "",
+          status: result.status || "success",
+          transport: result.transport || MMS_TRANSPORT,
+        });
+        await markProcessedIfConfigured(env, eventId, `mms_sent_${candidate.format}`);
+        return;
+      } catch (error) {
+        failures.push(`${candidate.format}: ${safeError(error)}`);
+        logEvent("mms_candidate_rejected", eventId, { ...details, error: safeError(error) }, "warn");
+      }
     }
+
+    logEvent("mms_failure", eventId, { error: failures.join("; ") }, "error");
+    const fallback = buildLinkFallbackText(notificationText, stored[0].url);
+    logEvent("fallback_attempt", eventId, { reason: "mms_failed", transport: "rest_get" }, "warn");
+    const result = await sendFallbackSms(env, fallback);
+    logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "", transport: result.transport || "unknown" });
+    await markProcessedIfConfigured(env, eventId, "sms_fallback");
   },
 
   async fetch(request, env) {
@@ -157,8 +158,9 @@ export default {
         // accepted by the API but delivered as a zero-byte attachment.
         mmsMediaReady: mediaUrlMissing.length === 0,
         mmsMediaMissingBindings: mediaUrlMissing,
-        audioPipeline: `WAV/MP3 attachment -> mono MP3 @ ${MP3_BITRATE_KBPS} kbps -> R2 -> signed media URL`,
-        outboundTransport: "VoIP.ms sendMMS GET with media1 = signed R2 recording URL",
+        mmsMediaFormats: parseMmsFormats(env.MMS_MEDIA_FORMATS),
+        defaultMmsMediaFormats: DEFAULT_MMS_FORMATS,
+        outboundTransport: "VoIP.ms sendMMS GET with media1 = recording URL, first accepted format wins",
       });
     }
 
@@ -175,42 +177,44 @@ export default {
   },
 };
 
-function transcodeForMms(eventId, attachment, sourceBytes) {
+function prepareCandidates(eventId, attachment, sourceBytes, env) {
+  const formats = parseMmsFormats(env.MMS_MEDIA_FORMATS);
   try {
-    const media = prepareMmsAudio(sourceBytes, MP3_BITRATE_KBPS);
-    if (media.transcoded) {
-      logEvent("audio_transcoded", eventId, {
-        sourceSize: media.sourceBytes,
-        mediaSize: media.bytes.byteLength,
-        sourceSampleRate: media.sourceSampleRate,
-        sampleRate: media.sampleRate,
-        bitrateKbps: media.bitrateKbps,
-        durationSeconds: media.durationSeconds,
-      });
-    }
-    return media;
+    const prepared = buildMmsCandidates(sourceBytes, formats);
+    const deliverable = prepared.candidates.filter((c) => c.bytes.byteLength <= MAX_MMS_AUDIO_BYTES);
+    logEvent("audio_prepared", eventId, {
+      sourceSize: prepared.sourceBytes,
+      sourceSampleRate: prepared.sourceSampleRate,
+      durationSeconds: prepared.durationSeconds,
+      order: deliverable.map((c) => `${c.format}:${c.bytes.byteLength}`).join(","),
+    });
+    return { ...prepared, candidates: deliverable, reason: deliverable.length ? "" : prepared.reason || "too_large" };
   } catch (error) {
     logEvent("audio_transcode_failure", eventId, { error: safeError(error) }, "error");
     return {
-      bytes: sourceBytes,
-      mimeType: mimeFromAttachment(attachment),
-      extension: extensionForAttachment(attachment),
-      transcoded: false,
-      deliverable: false,
       sourceBytes: sourceBytes.byteLength,
+      candidates: [],
       reason: "transcode_failed",
+      // Keep the untouched recording so the SMS fallback can still link to it.
+      original: {
+        format: extensionForAttachment(attachment),
+        bytes: sourceBytes,
+        mimeType: mimeFromAttachment(attachment),
+        extension: extensionForAttachment(attachment),
+      },
     };
   }
 }
 
-function undeliverableReason(env, media, archive) {
-  if (!media.deliverable) return media.reason || "unsupported_audio";
+function undeliverableReason(env, prepared, stored) {
+  if (!prepared.candidates.length) return prepared.reason || "unsupported_audio";
   // VoIP.ms only renders MMS media it can fetch for itself. Inline media
   // (base64 or a data: URL) is accepted by sendMMS and reports status
   // "success", but the delivered message carries a zero-byte attachment, so a
   // publicly reachable recording URL is required for a real MMS.
-  if (!archive?.url) return missingBindings(env, MEDIA_URL_BINDINGS).length ? "media_url_unconfigured" : "media_url_unavailable";
-  if (media.bytes.byteLength > MAX_MMS_AUDIO_BYTES) return "too_large";
+  if (!stored.some((candidate) => candidate.url)) {
+    return missingBindings(env, MEDIA_URL_BINDINGS).length ? "media_url_unconfigured" : "media_url_unavailable";
+  }
   return "";
 }
 
@@ -393,30 +397,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function archiveVoicemailIfConfigured(env, details) {
-  if (!env.VOICEMAIL_BUCKET) return null;
+/**
+ * Store every candidate and publish a fetchable URL for each, keeping the
+ * order so the caller can offer them to VoIP.ms one at a time.
+ */
+async function archiveCandidatesIfConfigured(env, details) {
+  const { prepared } = details;
+  const media = prepared.candidates.length ? prepared.candidates : [prepared.original].filter(Boolean);
+  if (!env.VOICEMAIL_BUCKET || !media.length) return media.map((candidate) => ({ ...candidate, url: "" }));
 
-  const { media } = details;
   const date = details.voicemailDate instanceof Date ? details.voicemailDate : new Date(details.voicemailDate);
   const iso = Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
   const [ymd] = iso.split("T");
   const [year, month, day] = ymd.split("-");
   const caller = safeFilenamePart(details.identity?.number || details.identity?.name || "unknown");
-  const key = `${RECORDING_PREFIX}${year}/${month}/${day}/${details.eventId}-${caller}.${media.extension}`;
 
-  await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
-    httpMetadata: { contentType: contentTypeForExtension(media.extension, media.mimeType) },
-    customMetadata: {
-      callerNumber: details.identity?.number || "",
-      callerName: details.identity?.name || "",
-      receivedAt: iso,
-    },
-  });
+  const stored = [];
+  for (const candidate of media) {
+    const key = `${RECORDING_PREFIX}${year}/${month}/${day}/${details.eventId}-${caller}.${candidate.extension}`;
+    await env.VOICEMAIL_BUCKET.put(key, candidate.bytes, {
+      httpMetadata: { contentType: contentTypeForExtension(candidate.extension, candidate.mimeType) },
+      customMetadata: {
+        callerNumber: details.identity?.number || "",
+        callerName: details.identity?.name || "",
+        receivedAt: iso,
+      },
+    });
+    stored.push({ ...candidate, key, url: await publishRecordingLink(env, key) });
+  }
 
-  const url = await publishRecordingLink(env, key);
-
-  console.log(`Archived voicemail ${details.eventId} to R2.`);
-  return { key, url };
+  console.log(`Archived voicemail ${details.eventId} to R2 as ${stored.map((c) => c.extension).join(", ")}.`);
+  return stored;
 }
 
 /**

@@ -1,10 +1,23 @@
 import lamejs from "@breezystack/lamejs";
 
-// VoIP.ms accepts MP3 as MMS media. WAV attachments (what Asterisk voicemail
-// produces by default) are rejected by the sendMMS media validator with
-// `invalid_media`, so every recording is transcoded to MP3 before delivery.
+// Two constraints pull in opposite directions, so the recording is offered to
+// VoIP.ms in more than one format and the first one it accepts is delivered:
+//
+//   - The sendMMS media validator has rejected WAV with `invalid_media`, while
+//     MP3 is accepted and rendered.
+//   - The receiving handset plays WAV but ignores MP3, so an accepted MP3 can
+//     still arrive as a message with nothing to play.
+//
+// WAV is therefore tried first and MP3 is the fallback. `MMS_MEDIA_FORMATS`
+// overrides the order without a code change.
+export const DEFAULT_MMS_FORMATS = ["wav", "mp3"];
 export const MP3_BITRATE_KBPS = 32;
 export const MP3_MIME_TYPE = "audio/mpeg";
+export const WAV_MIME_TYPE = "audio/wav";
+
+// 16-bit 8 kHz PCM runs 16 KB per second, so a long voicemail outgrows what
+// carriers carry as MMS. Past this the WAV candidate is dropped and MP3 ships.
+export const MAX_WAV_MMS_BYTES = 700_000;
 
 // MPEG-2.5 MP3 (8/11.025/12 kHz) is decoded inconsistently by handset MMS
 // players, so anything recorded below 16 kHz is upsampled to an MPEG-2 rate.
@@ -160,50 +173,107 @@ export function transcodeWavToMp3(bytes, bitrateKbps = MP3_BITRATE_KBPS) {
   };
 }
 
+/** Write mono PCM samples as a canonical 44-byte-header RIFF/WAVE file. */
+export function encodeWav(samples, sampleRate) {
+  const dataBytes = samples.length * 2;
+  const out = new Uint8Array(44 + dataBytes);
+  const view = new DataView(out.buffer);
+  const ascii = (offset, text) => {
+    for (let i = 0; i < text.length; i++) out[offset + i] = text.charCodeAt(i);
+  };
+
+  ascii(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  ascii(8, "WAVE");
+  ascii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, WAVE_FORMAT_PCM, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  ascii(36, "data");
+  view.setUint32(40, dataBytes, true);
+  for (let i = 0; i < samples.length; i++) view.setInt16(44 + i * 2, samples[i], true);
+
+  return out;
+}
+
+export function parseMmsFormats(value) {
+  const requested = String(value || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item === "wav" || item === "mp3");
+  return requested.length ? [...new Set(requested)] : DEFAULT_MMS_FORMATS;
+}
+
 /**
- * Normalize a voicemail attachment into MMS-deliverable media.
+ * Build the ordered list of media the Worker will offer VoIP.ms.
  *
- * MP3 passes straight through. WAV (PCM, A-law or mu-law) is transcoded.
- * Anything else is returned untouched so the caller can fall back to SMS.
+ * An MP3 attachment can only ship as MP3 — the Worker has no MP3 decoder, so
+ * there is nothing to re-encode a WAV candidate from. A WAV attachment yields
+ * whichever of the requested formats it can.
  */
-export function prepareMmsAudio(bytes, bitrateKbps = MP3_BITRATE_KBPS) {
+export function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
   const data = asBytes(bytes);
 
   if (isMp3(data)) {
     return {
-      bytes: data,
-      mimeType: MP3_MIME_TYPE,
-      extension: "mp3",
-      transcoded: false,
-      deliverable: true,
       sourceBytes: data.byteLength,
+      candidates: [{
+        format: "mp3",
+        bytes: data,
+        mimeType: MP3_MIME_TYPE,
+        extension: "mp3",
+        transcoded: false,
+      }],
     };
   }
 
   if (!isRiffWave(data)) {
-    return {
-      bytes: data,
-      mimeType: "application/octet-stream",
-      extension: "bin",
-      transcoded: false,
-      deliverable: false,
-      sourceBytes: data.byteLength,
-      reason: "unrecognized_audio_container",
-    };
+    return { sourceBytes: data.byteLength, candidates: [], reason: "unrecognized_audio_container" };
   }
 
-  const result = transcodeWavToMp3(data, bitrateKbps);
+  const decoded = decodeWavToMonoPcm16(data);
+  const durationSeconds = Math.round((decoded.samples.length / decoded.sampleRate) * 100) / 100;
+  const candidates = [];
+
+  for (const format of formats) {
+    if (format === "wav") {
+      // Re-encoded rather than forwarded so the header is canonical and the
+      // audio is mono, whatever shape the mailbox wrote.
+      const wav = encodeWav(decoded.samples, decoded.sampleRate);
+      if (wav.byteLength > MAX_WAV_MMS_BYTES) continue;
+      candidates.push({
+        format: "wav",
+        bytes: wav,
+        mimeType: WAV_MIME_TYPE,
+        extension: "wav",
+        transcoded: true,
+        sampleRate: decoded.sampleRate,
+      });
+    } else if (format === "mp3") {
+      const sampleRate = chooseMp3SampleRate(decoded.sampleRate);
+      const samples = resamplePcm16(decoded.samples, decoded.sampleRate, sampleRate);
+      candidates.push({
+        format: "mp3",
+        bytes: encodeMonoPcm16ToMp3(samples, sampleRate, MP3_BITRATE_KBPS),
+        mimeType: MP3_MIME_TYPE,
+        extension: "mp3",
+        transcoded: true,
+        sampleRate,
+        bitrateKbps: MP3_BITRATE_KBPS,
+      });
+    }
+  }
+
   return {
-    bytes: result.bytes,
-    mimeType: MP3_MIME_TYPE,
-    extension: "mp3",
-    transcoded: true,
-    deliverable: true,
     sourceBytes: data.byteLength,
-    sampleRate: result.sampleRate,
-    sourceSampleRate: result.sourceSampleRate,
-    bitrateKbps: result.bitrateKbps,
-    durationSeconds: result.durationSeconds,
+    sourceSampleRate: decoded.sampleRate,
+    durationSeconds,
+    candidates,
+    reason: candidates.length ? "" : "no_deliverable_format",
   };
 }
 
