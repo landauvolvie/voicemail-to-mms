@@ -60,7 +60,7 @@ Configure these in **Workers & Pages → voicemail-to-mms → Settings → Varia
 | `MMS_DESTINATION` | Text | Phone number that receives the voicemail MMS |
 | `PUBLIC_BASE_URL` | Text | Public URL of this Worker, no trailing slash. Backs the SMS listening link and the URL transport. |
 
-An R2 bucket bound as `VOICEMAIL_BUCKET` stores the recordings and backs the listening links. The default file-upload transport carries the audio in the request itself, so MMS delivery does not depend on either.
+An R2 bucket bound as `VOICEMAIL_BUCKET` stores the recordings, backs the listening links, and serves the media the default `get_url` transport points VoIP.ms at. Only `multipart_file` works without them, by carrying the audio in the request itself.
 
 No credentials or phone numbers are committed to GitHub.
 
@@ -89,7 +89,7 @@ The recording is attached as the MMS media.
 - Audio too large for MMS after transcoding: send an SMS with a listening link.
 - Recording in a format the Worker cannot transcode (for example GSM 6.10 `wav49`): archive it as-is and send an SMS with a listening link.
 - Every media format rejected by VoIP.ms: send an SMS with a listening link.
-- No fetchable media URL configured and only URL transports enabled: send an SMS naming that as the reason. The file-upload transport needs no hosting and is still attempted.
+- No fetchable media URL configured, with only URL transports enabled: send an SMS naming that as the reason.
 - VoIP.ms MMS failure: send an SMS with a listening link.
 - Temporary VoIP.ms/API rate errors: retry with short exponential backoff.
 - Unexpected sender domains: reject the incoming email so the public voicemail address cannot easily be abused as an MMS relay.
