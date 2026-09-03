@@ -25,10 +25,14 @@ const VOIPMS_3CX_ENDPOINT = "https://voip.ms/api/3cx/msg";
 const MAX_EMAIL_BYTES = 12 * 1024 * 1024;
 const REQUIRED_BINDINGS = ["VOIPMS_API_USERNAME", "VOIPMS_API_PASSWORD", "VOIPMS_DID", "MMS_DESTINATION"];
 const MEDIA_URL_BINDINGS = ["VOICEMAIL_BUCKET", "PUBLIC_BASE_URL"];
-// The portal uploads the recording as a file, so that transport goes first;
-// the URL transport is what the API has been refusing for WAV.
-const MMS_TRANSPORTS = ["multipart_file", "multipart_url", "post_url", "get_url"];
-const DEFAULT_MMS_TRANSPORTS = ["multipart_file", "get_url"];
+// Only `get_url` reports failure honestly. `multipart_file` answers "success"
+// and sends the text with no attachment at all; base64 and data: URLs answer
+// "success" and attach zero bytes. A silent success is worse than a refusal
+// here, because it suppresses the SMS fallback and the voicemail is lost, so
+// only the honest transport is enabled by default. The rest stay available for
+// /diagnostics/media-probe.
+const MMS_TRANSPORTS = ["get_url", "multipart_file", "multipart_url", "post_url"];
+const DEFAULT_MMS_TRANSPORTS = ["get_url"];
 const RECORDING_PREFIX = "voicemails/";
 const LINK_PREFIX = "links/";
 const PROBE_PREFIX = "probes/";
@@ -616,8 +620,10 @@ async function runMediaProbe(request, env) {
   const url = new URL(request.url);
   // The format question is settled — the recording plays once it arrives — so
   // the probe defaults to one WAV across every transport instead.
-  const variants = parseProbeVariants(url.searchParams.get("variants") || "wav-8k-pcm16");
-  const transports = parseProbeTransports(url.searchParams.get("transports"));
+  const variants = parseProbeVariants(
+    url.searchParams.get("variants") || "wav-as-mp3,wav-as-mp3-wavtype,wav-8k-pcm16",
+  );
+  const transports = parseProbeTransports(url.searchParams.get("transports") || "get_url");
   const seconds = clampInt(url.searchParams.get("seconds"), 1, 10, 2);
   const results = [];
   let index = 0;
@@ -626,7 +632,7 @@ async function runMediaProbe(request, env) {
     const media = buildProbeMedia(name, seconds);
     const key = `${PROBE_PREFIX}${Date.now()}-${name}.${media.extension}`;
     await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
-      httpMetadata: { contentType: contentTypeForExtension(media.extension, media.mimeType) },
+      httpMetadata: { contentType: media.mimeType },
     });
     const published = await publishRecordingLink(env, key);
     const candidate = { ...media, ...published };
@@ -776,7 +782,7 @@ async function streamRecording(env, key, isHead) {
   const filename = key.split("/").pop()?.replace(/[^a-zA-Z0-9_.-]/g, "_") || "voicemail.mp3";
   const headers = new Headers();
   object.writeHttpMetadata(headers);
-  headers.set("content-type", contentTypeForExtension(filename.split(".").pop(), headers.get("content-type")));
+  headers.set("content-type", headers.get("content-type") || contentTypeForExtension(filename.split(".").pop()));
   headers.set("content-length", String(object.size));
   headers.set("accept-ranges", "bytes");
   headers.set("cache-control", "private, no-store");

@@ -18,6 +18,12 @@ import {
  * MMS, so the probe is behind a key and never runs on its own.
  */
 export const PROBE_VARIANTS = [
+  // `-as-mp3` variants are WAV bytes published under an .mp3 name. If the URL
+  // validator that refuses .wav keys on the extension rather than the content,
+  // these get past it, and what reaches the handset then depends on whether
+  // VoIP.ms labels the MMS part from the URL or from the bytes.
+  "wav-as-mp3",
+  "wav-as-mp3-wavtype",
   "wav-8k-pcm16",
   "wav-16k-pcm16",
   "wav-22k-pcm16",
@@ -52,6 +58,10 @@ export function buildProbeMedia(name, seconds = 2) {
   const at = (rate) => resamplePcm16(base, 8000, rate);
 
   switch (name) {
+    case "wav-as-mp3":
+      return { bytes: encodeWav(base, 8000), extension: "mp3", mimeType: MP3_MIME_TYPE };
+    case "wav-as-mp3-wavtype":
+      return { bytes: encodeWav(base, 8000), extension: "mp3", mimeType: WAV_MIME_TYPE };
     case "wav-8k-pcm16":
       return wav(encodeWav(base, 8000));
     case "wav-16k-pcm16":

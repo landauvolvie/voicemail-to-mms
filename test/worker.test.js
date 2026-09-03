@@ -182,8 +182,20 @@ async function runEmail(env, raw, respond) {
 const okMms = () => new Response(JSON.stringify({ status: "success", mms: 10208872 }), { status: 200 });
 const okSms = () => new Response(JSON.stringify({ status: "success", sms: 10208873 }), { status: 200 });
 
-test("uploads the WAV as a real multipart file part, the way the portal does", async () => {
+test("defaults to the transport that reports failure honestly", async () => {
+  // multipart_file and the base64 transports answer "success" while dropping
+  // the audio, which suppresses the SMS fallback and loses the voicemail.
   const env = makeEnv();
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+  assert.match(calls[0].get("media1"), /\/r\/[A-Za-z0-9_-]{22}\.wav$/);
+  assert.equal(calls[0].file, null, "the default transport links the recording, it does not upload it");
+});
+
+test("uploads the WAV as a real multipart file part when that transport is chosen", async () => {
+  const env = makeEnv({ MMS_TRANSPORTS: "multipart_file" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(3)), okMms);
 
   assert.equal(calls.length, 1, "one VoIP.ms call, no SMS fallback");
@@ -210,7 +222,7 @@ test("uploads the WAV as a real multipart file part, the way the portal does", a
 });
 
 test("falls back to the media URL when the file upload is refused", async () => {
-  const env = makeEnv();
+  const env = makeEnv({ MMS_TRANSPORTS: "multipart_file,get_url" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (call) =>
     call.multipart
       ? new Response(JSON.stringify({ status: "invalid_file" }), { status: 200 })
@@ -223,7 +235,7 @@ test("falls back to the media URL when the file upload is refused", async () => 
 });
 
 test("honours MMS_TRANSPORTS and MMS_MEDIA_FORMATS", async () => {
-  const env = makeEnv({ MMS_TRANSPORTS: "get_url", MMS_MEDIA_FORMATS: "mp3" });
+  const env = makeEnv({ MMS_MEDIA_FORMATS: "mp3" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
 
   assert.equal(calls.length, 1);
@@ -247,8 +259,6 @@ test("tries every format over every transport before giving up", async () => {
 
 test("serves the signed recording URL with an audio content type and length", async () => {
   const env = makeEnv();
-  const env2 = makeEnv({ MMS_TRANSPORTS: "get_url" });
-  Object.assign(env, env2, { VOICEMAIL_BUCKET: env.VOICEMAIL_BUCKET });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
   const mediaUrl = calls[0].get("media1");
 
@@ -276,7 +286,7 @@ test("serves the signed recording URL with an audio content type and length", as
 });
 
 test("passes an MP3 attachment through without re-encoding", async () => {
-  const env = makeEnv();
+  const env = makeEnv({ MMS_TRANSPORTS: "multipart_file" });
   const mp3 = new Uint8Array([0xff, 0xfb, 0x90, 0x00, ...new Uint8Array(4096)]);
   const raw = buildVoicemailEmail(mp3, { filename: "msg0009.MP3", mimeType: "audio/mpeg" });
   const calls = await runEmail(env, raw, okMms);
@@ -316,7 +326,7 @@ test("falls back to SMS with a listening link when VoIP.ms rejects the MMS", asy
 
 test("uploads the recording even with no public media URL configured", async () => {
   // The file transport carries the bytes itself, so hosting is not required.
-  const env = makeEnv({ PUBLIC_BASE_URL: "" });
+  const env = makeEnv({ PUBLIC_BASE_URL: "", MMS_TRANSPORTS: "multipart_file" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okMms);
 
   assert.equal(calls.length, 1);
@@ -325,7 +335,7 @@ test("uploads the recording even with no public media URL configured", async () 
 });
 
 test("falls back to SMS when a URL-only transport has no media URL", async () => {
-  const env = makeEnv({ PUBLIC_BASE_URL: "", MMS_TRANSPORTS: "get_url" });
+  const env = makeEnv({ PUBLIC_BASE_URL: "" });
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), okSms);
 
   assert.equal(calls.length, 1);
@@ -367,6 +377,6 @@ test("health endpoint reports the media-URL transport", async () => {
   assert.equal(body.mmsMediaReady, true);
   assert.deepEqual(body.mmsMediaMissingBindings, []);
   assert.deepEqual(body.mmsMediaFormats, ["wav"]);
-  assert.deepEqual(body.mmsTransports, ["multipart_file", "get_url"]);
+  assert.deepEqual(body.mmsTransports, ["get_url"]);
   assert.match(body.outboundTransport, /first accepted format\/transport pair wins/);
 });
