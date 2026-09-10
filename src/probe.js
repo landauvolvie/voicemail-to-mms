@@ -1,3 +1,4 @@
+import { OGG_MIME_TYPE, encodeOggVorbis } from "./ogg.js";
 import {
   MP3_BITRATE_KBPS,
   MP3_MIME_TYPE,
@@ -18,6 +19,10 @@ import {
  * MMS, so the probe is behind a key and never runs on its own.
  */
 export const PROBE_VARIANTS = [
+  // Ogg Vorbis is not on the published list of permitted attachments, so this
+  // is the open question: does the validator go by that list or by something
+  // broader?
+  "ogg-8k",
   // `-as-mp3` variants are WAV bytes published under an .mp3 name. If the URL
   // validator that refuses .wav keys on the extension rather than the content,
   // these get past it, and what reaches the handset then depends on whether
@@ -53,11 +58,13 @@ export function probeTone(seconds = 2, sampleRate = 8000) {
   return samples;
 }
 
-export function buildProbeMedia(name, seconds = 2) {
+export async function buildProbeMedia(name, seconds = 2) {
   const base = probeTone(seconds, 8000);
   const at = (rate) => resamplePcm16(base, 8000, rate);
 
   switch (name) {
+    case "ogg-8k":
+      return { bytes: await encodeOggVorbis(base, 8000), extension: "ogg", mimeType: OGG_MIME_TYPE };
     case "wav-as-mp3":
       return { bytes: encodeWav(base, 8000), extension: "mp3", mimeType: MP3_MIME_TYPE };
     case "wav-as-mp3-wavtype":
