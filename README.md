@@ -31,24 +31,27 @@ Three behaviours drive the delivery path, all observed against the live API and 
 
 Two of those are silent successes, which is the worst outcome: `sendMMS` reports a message ID, the SMS fallback never fires, and the voicemail is lost. `get_url` is the only transport that fails honestly, so it is the only one enabled by default — a refusal there hands off to an SMS carrying a link that plays.
 
-**Ogg Vorbis is offered first.** It is not on the published list of permitted attachments, so it may be refused like WAV — but it is the container the handset's own voice notes use, and an 8-second voicemail is 6.9 KB as Ogg against 128 KB as WAV. WAV follows it, so a refusal costs one extra API call and nothing else.
+### What VoIP.ms accepts, and the two different validators
 
-MP3 stays out of the default deliberately. The API accepts it and the carrier drops it, so it reports success, suppresses the SMS fallback, and delivers nothing.
+Uploading an `.ogg` file through the Customer Portal returns its exact whitelist verbatim:
+
+> Invalid extension for file "…​.ogg". Only "jpg, gif, jpeg, png, PNG, GIF, mp3, wav, midi, MP3, WAV, MIDI, mp4, MP4, 3gp, 3GP" files are supported.
+
+So Ogg is ruled out at the door and is not worth encoding. Only these matter, and of them only four can carry speech:
+
+| Format | State |
+| --- | --- |
+| `mp3` | `sendMMS` accepts it; the carrier drops it before it reaches the handset. |
+| `wav` | The portal sends it and it plays; `sendMMS` refuses it as `invalid_media`. |
+| `midi` | Cannot carry a recording. |
+| `mp4`, `3gp` | **Untested.** The only permitted containers not yet tried. |
+
+Note that the two checks are not the same code. The portal rejects on **file extension** — it accepts `.wav` and never looks further. The `sendMMS` media fetch rejects on **file content**: WAV bytes published under an `.mp3` name and served as `audio/mpeg` are refused, while real MP3 at that identical URL is accepted. That difference is why the portal sends a file the API will not.
 
 Two knobs control the attempt order, and the Worker tries every format over every transport before giving up:
 
-- `MMS_MEDIA_FORMATS` - `ogg,wav` (default), plus `mp3` in any order
+- `MMS_MEDIA_FORMATS` - `wav` (default), `mp3`, `wav,mp3`, `mp3,wav`
 - `MMS_TRANSPORTS` - `get_url` (default), plus `multipart_file`, `multipart_url` and `post_url`
-
-### Encoding in a Worker
-
-The Workers runtime refuses runtime WebAssembly compilation outright:
-
-```
-WebAssembly.instantiate(): Wasm code generation disallowed by embedder
-```
-
-So every emscripten audio encoder that compiles from an `ArrayBuffer` fails in production, however it is loaded. `vendor/ogg.wasm` is therefore imported by `src/ogg-wasm.js` and compiled by Wrangler at build time, which the runtime does accept. Node has the opposite constraint in tests — it cannot import `.wasm` as a module — so `test/setup.js` hands the encoder the raw bytes instead.
 
 `mms_success` names the winning format and transport; each refusal is logged as `mms_candidate_rejected` with the API's own reason.
 
@@ -56,13 +59,11 @@ So every emscripten audio encoder that compiles from an `ArrayBuffer` fails in p
 
 `GET /diagnostics/media-probe?key=<PROBE_KEY or RECORDING_LINK_SECRET>` sends one short test MMS per format/transport pair and reports which ones `sendMMS` accepts, so the API's verdict on a whole set is known in one request instead of one voicemail at a time.
 
-Variants: `ogg-8k`, `wav-as-mp3`, `wav-as-mp3-wavtype`, `wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`. Select with `&variants=`, narrow transports with `&transports=`, and set clip length with `&seconds=`.
-
-The `wav-as-mp3` pair settled an earlier question: WAV bytes published under an `.mp3` name were refused with `invalid_media` under both `audio/mpeg` and `audio/wav`, while real MP3 at that same URL shape is accepted. The validator reads file content, not the name or the header.
+It defaults to the one question still open: whether the URL validator that refuses `.wav` keys on the extension rather than the content. The `wav-as-mp3` variants publish WAV bytes under an `.mp3` name, one labelled `audio/mpeg` and one `audio/wav`, alongside a plain `.wav` control. Widen it with `&variants=` (`wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`), narrow it with `&transports=`, and set clip length with `&seconds=`.
 
 These are real, billable messages to `MMS_DESTINATION`, so the endpoint 404s without the key and never runs on its own. Anything the API accepts still has to survive the carrier — check which numbered probes actually arrive.
 
-Ogg is Vorbis, mono, VBR quality 0 at the recorded sample rate. WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
+WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
 
 ## Required Cloudflare variables/secrets
 
@@ -87,7 +88,7 @@ No credentials or phone numbers are committed to GitHub.
 | `TIME_ZONE` | Notification time zone. Defaults to `America/New_York`. |
 | `CONTACTS_JSON` | Optional JSON phone-to-name map, e.g. `{"8455551212":"John Smith"}`. A matching contact name overrides Caller ID name from the voicemail email. |
 | `ALLOWED_SENDER_DOMAINS` | Comma-separated sender domains. Defaults to `voip.ms,voipinterface.net`. |
-| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `ogg,wav`. |
+| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav`. |
 | `MMS_TRANSPORTS` | Ordered `sendMMS` transports. Defaults to `get_url`, the only one that reports failure honestly. |
 | `PROBE_KEY` | Key for `/diagnostics/media-probe`. Falls back to `RECORDING_LINK_SECRET`; the probe is disabled when neither is set. |
 
@@ -152,5 +153,5 @@ Cloudflare's Git integration deploys this Worker automatically on every push to 
 Tests cover three layers:
 
 - `test/core.test.js` - NANP normalization, caller-ID extraction, sender-domain validation, contact-name overrides.
-- `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes), candidate ordering and size limits, Ogg output checked for page capture pattern and Vorbis identification header, and MP3 output verified by walking real MP3 frame headers for sample rate, version and duration.
+- `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes), candidate ordering and size limits, and MP3 output verified by walking real MP3 frame headers for sample rate, version and duration.
 - `test/worker.test.js` - the whole email handler against a stubbed VoIP.ms API and an in-memory R2, asserting that `media1` is a fetchable URL rather than inline data, that a WAV rejection falls through to the MP3 candidate, that recording URLs serve the right content type and length over GET and HEAD, and that every SMS fallback fits one segment with its link intact.

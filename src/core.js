@@ -179,8 +179,6 @@ export function contentTypeForExtension(extension, fallback = "application/octet
     case "wav":
     case "wav49":
       return "audio/wav";
-    case "ogg":
-      return "audio/ogg";
     default:
       return fallback || "application/octet-stream";
   }

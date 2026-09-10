@@ -1,5 +1,4 @@
 import lamejs from "@breezystack/lamejs";
-import { OGG_MIME_TYPE, OGG_VBR_QUALITY, encodeOggVorbis } from "./ogg.js";
 
 // Two constraints pull in opposite directions and, so far, admit no overlap:
 //
@@ -11,12 +10,10 @@ import { OGG_MIME_TYPE, OGG_VBR_QUALITY, encodeOggVorbis } from "./ogg.js";
 //
 // So MP3 is accepted by the API and then vanishes, which is worse than a
 // refusal: sendMMS reports success, no fallback fires, and nothing arrives.
-// Ogg Vorbis is tried ahead of WAV. It is not on the published list of
-// permitted attachments, so it may be refused too, but it is the container the
-// handset's own voice notes use, and it is a fifth the size. MP3 stays out of
-// the default: the API accepts it and the carrier drops it, which reports
-// success and delivers nothing, suppressing the SMS fallback as well.
-export const DEFAULT_MMS_FORMATS = ["ogg", "wav"];
+// The default therefore offers WAV only — if VoIP.ms refuses it the Worker
+// falls back to an SMS carrying a link that actually plays. Add "mp3" to
+// `MMS_MEDIA_FORMATS` if the carrier ever starts accepting it.
+export const DEFAULT_MMS_FORMATS = ["wav"];
 export const MP3_BITRATE_KBPS = 32;
 export const MP3_MIME_TYPE = "audio/mpeg";
 export const WAV_MIME_TYPE = "audio/wav";
@@ -237,13 +234,11 @@ export function encodeWav(samples, sampleRate, channels = 1) {
   return out;
 }
 
-export const SUPPORTED_MMS_FORMATS = ["ogg", "wav", "mp3"];
-
 export function parseMmsFormats(value) {
   const requested = String(value || "")
     .split(",")
     .map((item) => item.trim().toLowerCase())
-    .filter((item) => SUPPORTED_MMS_FORMATS.includes(item));
+    .filter((item) => item === "wav" || item === "mp3");
   return requested.length ? [...new Set(requested)] : DEFAULT_MMS_FORMATS;
 }
 
@@ -254,7 +249,7 @@ export function parseMmsFormats(value) {
  * there is nothing to re-encode a WAV candidate from. A WAV attachment yields
  * whichever of the requested formats it can.
  */
-export async function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
+export function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
   const data = asBytes(bytes);
 
   if (isMp3(data)) {
@@ -289,15 +284,6 @@ export async function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
         bytes: wav,
         mimeType: WAV_MIME_TYPE,
         extension: "wav",
-        transcoded: true,
-        sampleRate: decoded.sampleRate,
-      });
-    } else if (format === "ogg") {
-      candidates.push({
-        format: "ogg",
-        bytes: await encodeOggVorbis(decoded.samples, decoded.sampleRate, OGG_VBR_QUALITY),
-        mimeType: OGG_MIME_TYPE,
-        extension: "ogg",
         transcoded: true,
         sampleRate: decoded.sampleRate,
       });

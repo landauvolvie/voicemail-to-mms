@@ -1,11 +1,9 @@
-import "./setup.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_WAV_MMS_BYTES,
   MP3_MIME_TYPE,
   WAV_MIME_TYPE,
-  DEFAULT_MMS_FORMATS,
   buildMmsCandidates,
   chooseMp3SampleRate,
   decodeWavToMonoPcm16,
@@ -194,26 +192,12 @@ test("transcodes an 8 kHz WAV voicemail into a decodable MP3", () => {
   assert.ok(Math.abs(mp3.durationSeconds - 3) < 0.2, `unexpected duration ${mp3.durationSeconds}`);
 });
 
-test("defaults to Ogg then WAV, leaving out the format that vanishes in transit", () => {
-  assert.deepEqual(parseMmsFormats(""), ["ogg", "wav"]);
-  assert.deepEqual(DEFAULT_MMS_FORMATS, ["ogg", "wav"]);
-  assert.ok(!DEFAULT_MMS_FORMATS.includes("mp3"), "MP3 reports success and delivers nothing");
+test("defaults to WAV only, since an accepted MP3 is silently dropped in transit", () => {
+  assert.deepEqual(parseMmsFormats(""), ["wav"]);
 });
 
-test("encodes the recording as real Ogg Vorbis, far smaller than the WAV", async () => {
-  const { candidates } = await buildMmsCandidates(buildWav(tone(3)), ["ogg", "wav"]);
-  assert.deepEqual(candidates.map((c) => c.format), ["ogg", "wav"]);
-
-  const [ogg, wav] = candidates;
-  assert.equal(ogg.mimeType, "audio/ogg");
-  assert.equal(ogg.extension, "ogg");
-  assert.equal(String.fromCharCode(...ogg.bytes.subarray(0, 4)), "OggS", "Ogg page capture pattern");
-  assert.equal(String.fromCharCode(...ogg.bytes.subarray(29, 35)), "vorbis", "Vorbis identification header");
-  assert.ok(ogg.bytes.byteLength * 3 < wav.bytes.byteLength, `expected a much smaller file, got ${ogg.bytes.byteLength} vs ${wav.bytes.byteLength}`);
-});
-
-test("offers WAV before MP3 when both are requested", async () => {
-  const { candidates, durationSeconds } = await buildMmsCandidates(buildWav(tone(2)), ["wav", "mp3"]);
+test("offers WAV before MP3 when both are requested", () => {
+  const { candidates, durationSeconds } = buildMmsCandidates(buildWav(tone(2)), ["wav", "mp3"]);
 
   assert.deepEqual(candidates.map((c) => c.format), ["wav", "mp3"]);
   assert.equal(durationSeconds, 2);
@@ -230,32 +214,32 @@ test("offers WAV before MP3 when both are requested", async () => {
   assert.ok(mp3.bytes.byteLength < wav.bytes.byteLength, "MP3 should be the smaller candidate");
 });
 
-test("honours a configured format order", async () => {
+test("honours a configured format order", () => {
   assert.deepEqual(parseMmsFormats("mp3,wav"), ["mp3", "wav"]);
   assert.deepEqual(parseMmsFormats("MP3"), ["mp3"]);
-  assert.deepEqual(parseMmsFormats("flac,aac"), ["ogg", "wav"], "unknown formats fall back to the default");
+  assert.deepEqual(parseMmsFormats("ogg,flac"), ["wav"], "unknown formats fall back to the default");
 
-  const { candidates } = await buildMmsCandidates(buildWav(tone(1)), parseMmsFormats("mp3"));
+  const { candidates } = buildMmsCandidates(buildWav(tone(1)), parseMmsFormats("mp3"));
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
 });
 
-test("drops the WAV candidate once it outgrows MMS", async () => {
+test("drops the WAV candidate once it outgrows MMS", () => {
   // 16-bit 8 kHz PCM is 16 KB/s, so this clip lands well past the WAV ceiling.
   const seconds = MAX_WAV_MMS_BYTES / 16000 + 5;
-  const { candidates } = await buildMmsCandidates(buildWav(tone(seconds)), ["wav", "mp3"]);
+  const { candidates } = buildMmsCandidates(buildWav(tone(seconds)), ["wav", "mp3"]);
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"], "long recordings ship as MP3 only");
 });
 
-test("an MP3 attachment can only ship as MP3", async () => {
-  const mp3 = (await buildMmsCandidates(buildWav(tone(1)), ["mp3"])).candidates[0].bytes;
-  const { candidates } = await buildMmsCandidates(mp3, ["mp3"]);
+test("an MP3 attachment can only ship as MP3", () => {
+  const mp3 = buildMmsCandidates(buildWav(tone(1)), ["mp3"]).candidates[0].bytes;
+  const { candidates } = buildMmsCandidates(mp3);
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);
   assert.equal(candidates[0].transcoded, false);
   assert.equal(candidates[0].bytes, mp3);
 });
 
-test("flags containers it cannot deliver", async () => {
-  const result = await buildMmsCandidates(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04]));
+test("flags containers it cannot deliver", () => {
+  const result = buildMmsCandidates(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04]));
   assert.deepEqual(result.candidates, []);
   assert.equal(result.reason, "unrecognized_audio_container");
 });

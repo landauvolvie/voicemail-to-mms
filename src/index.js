@@ -105,7 +105,7 @@ export default {
     // The recording itself is known good — these exact bytes were uploaded by
     // hand through the VoIP.ms portal and arrived playable. Only the API path
     // refuses them, so each format is offered over each transport in turn.
-    const prepared = await prepareCandidates(eventId, audio, sourceBytes, env);
+    const prepared = prepareCandidates(eventId, audio, sourceBytes, env);
     const stored = await archiveCandidatesIfConfigured(env, {
       eventId,
       prepared,
@@ -196,10 +196,10 @@ export default {
   },
 };
 
-async function prepareCandidates(eventId, attachment, sourceBytes, env) {
+function prepareCandidates(eventId, attachment, sourceBytes, env) {
   const formats = parseMmsFormats(env.MMS_MEDIA_FORMATS);
   try {
-    const prepared = await buildMmsCandidates(sourceBytes, formats);
+    const prepared = buildMmsCandidates(sourceBytes, formats);
     const deliverable = prepared.candidates.filter((c) => c.bytes.byteLength <= MAX_MMS_AUDIO_BYTES);
     logEvent("audio_prepared", eventId, {
       sourceSize: prepared.sourceBytes,
@@ -629,7 +629,7 @@ async function runMediaProbe(request, env) {
   let index = 0;
 
   for (const name of variants) {
-    const media = await buildProbeMedia(name, seconds);
+    const media = buildProbeMedia(name, seconds);
     const key = `${PROBE_PREFIX}${Date.now()}-${name}.${media.extension}`;
     await env.VOICEMAIL_BUCKET.put(key, media.bytes, {
       httpMetadata: { contentType: media.mimeType },
