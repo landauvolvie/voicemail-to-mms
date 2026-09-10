@@ -113,10 +113,11 @@ export default {
       voicemailDate,
     });
 
+    const listenUrl = listenLink(stored);
     const blocked = undeliverableReason(env, prepared, stored);
     if (blocked) {
-      const fallback = stored[0]?.pageUrl
-        ? buildLinkFallbackText(notificationText, stored[0].pageUrl)
+      const fallback = listenUrl
+        ? buildLinkFallbackText(notificationText, listenUrl)
         : buildFallbackText(notificationText, blocked);
       logEvent("fallback_attempt", eventId, { reason: blocked, transport: "rest_get" }, "warn");
       const result = await sendFallbackSms(env, fallback);
@@ -128,6 +129,7 @@ export default {
     const transports = parseMmsTransports(env.MMS_TRANSPORTS);
     const failures = [];
     for (const candidate of stored) {
+      if (candidate.listenOnly) continue; // archived for the link, never offered to VoIP.ms
       const details = { format: candidate.format, mediaType: candidate.mimeType, mediaSize: candidate.bytes.byteLength };
       for (const transport of transports) {
         // A URL transport needs a published URL; a file transport does not.
@@ -151,7 +153,7 @@ export default {
     }
 
     logEvent("mms_failure", eventId, { error: failures.join("; ") }, "error");
-    const fallback = buildLinkFallbackText(notificationText, stored[0].pageUrl);
+    const fallback = buildLinkFallbackText(notificationText, listenUrl);
     logEvent("fallback_attempt", eventId, { reason: "mms_failed", transport: "rest_get" }, "warn");
     const result = await sendFallbackSms(env, fallback);
     logEvent("fallback_success", eventId, { reason: "mms_failed", messageId: result.sms || "", transport: result.transport || "unknown" });
@@ -223,6 +225,12 @@ function prepareCandidates(eventId, attachment, sourceBytes, env) {
       },
     };
   }
+}
+
+/** The archived rendition a person can actually play in a browser. */
+function listenLink(stored) {
+  const playable = stored.find((candidate) => candidate.extension === "wav" || candidate.extension === "mp3");
+  return (playable || stored[0])?.pageUrl || "";
 }
 
 function undeliverableReason(env, prepared, stored) {
@@ -549,7 +557,10 @@ function sleep(ms) {
  */
 async function archiveCandidatesIfConfigured(env, details) {
   const { prepared } = details;
-  const media = prepared.candidates.length ? prepared.candidates : [prepared.original].filter(Boolean);
+  const base = prepared.candidates.length ? prepared.candidates : [prepared.original].filter(Boolean);
+  // The listen rendition is archived too when it is not already a candidate,
+  // so the SMS link always has something a browser can play.
+  const media = prepared.listen && !base.includes(prepared.listen) ? [...base, prepared.listen] : base;
   if (!env.VOICEMAIL_BUCKET || !media.length) return media.map((candidate) => ({ ...candidate, url: "", pageUrl: "" }));
 
   const date = details.voicemailDate instanceof Date ? details.voicemailDate : new Date(details.voicemailDate);

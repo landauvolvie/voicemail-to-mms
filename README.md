@@ -140,7 +140,7 @@ The R2 bucket bound as `VOICEMAIL_BUCKET` holds three things:
 - `links/<token>` - a pointer that maps a 128-bit random token to a recording and an expiry.
 - `events/<id>.json` - a processed-event marker so duplicate email delivery does not generate duplicate texts.
 
-Recording URLs look like `https://<worker-host>/r/<token>`, which renders a small player page naming the caller and time. The same token plus the file extension (`/r/<token>.wav`) serves the audio itself, and that is what VoIP.ms fetches as MMS media. The token is the secret, which keeps the URL short enough to survive inside a 160-character SMS fallback; the previous long signed URL was cut off mid-link and unusable.
+Recording URLs look like `https://<worker-host>/r/<token>`, which renders a small player page naming the caller and time. The link always points at a WAV or MP3 rendition, never the 3GP or MP4 one: no browser decodes AMR, so a link to it opens a player stuck at 0:00. When the configured MMS order contains no browser-playable format, an MP3 is archived for the link alone and never offered to VoIP.ms. The same token plus the file extension (`/r/<token>.wav`) serves the audio itself, and that is what VoIP.ms fetches as MMS media. The token is the secret, which keeps the URL short enough to survive inside a 160-character SMS fallback; the previous long signed URL was cut off mid-link and unusable.
 
 Optional:
 

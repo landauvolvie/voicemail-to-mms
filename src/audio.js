@@ -242,6 +242,10 @@ export function encodeWav(samples, sampleRate, channels = 1) {
 
 export const SUPPORTED_MMS_FORMATS = ["3gp", "mp4", "wav", "mp3"];
 
+// What a browser will decode from an <audio> element. AMR is not on the list,
+// which is why the listening link never points at the 3GP or MP4 rendition.
+const BROWSER_PLAYABLE_FORMATS = ["wav", "mp3"];
+
 export function parseMmsFormats(value) {
   const requested = String(value || "")
     .split(",")
@@ -330,7 +334,34 @@ export function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
     sourceSampleRate: decoded.sampleRate,
     durationSeconds,
     candidates,
+    listen: buildListenRendition(candidates, decoded),
     reason: candidates.length ? "" : "no_deliverable_format",
+  };
+}
+
+/**
+ * Pick the rendition the SMS link should play.
+ *
+ * The MMS candidates are ordered for VoIP.ms, not for people: AMR-in-3GP
+ * leads, and no browser decodes AMR — a link to it opens a player stuck at
+ * 0:00. So the link gets a format browsers actually play, reusing a candidate
+ * when the order already contains one and encoding an MP3 when it does not.
+ */
+function buildListenRendition(candidates, decoded) {
+  const playable = candidates.find((candidate) => BROWSER_PLAYABLE_FORMATS.includes(candidate.format));
+  if (playable) return playable;
+
+  const sampleRate = chooseMp3SampleRate(decoded.sampleRate);
+  const samples = resamplePcm16(decoded.samples, decoded.sampleRate, sampleRate);
+  return {
+    format: "mp3",
+    bytes: encodeMonoPcm16ToMp3(samples, sampleRate, MP3_BITRATE_KBPS),
+    mimeType: MP3_MIME_TYPE,
+    extension: "mp3",
+    transcoded: true,
+    sampleRate,
+    bitrateKbps: MP3_BITRATE_KBPS,
+    listenOnly: true,
   };
 }
 

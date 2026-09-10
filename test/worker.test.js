@@ -201,6 +201,26 @@ test("offers AMR-in-3GP first, over the transport that reports failure honestly"
   assert.equal(stored.httpMetadata.contentType, "audio/3gpp");
 });
 
+test("links to a playable rendition even when no MMS candidate is one", async () => {
+  // 3gp and mp4 are both AMR; with WAV out of the order nothing offered to
+  // VoIP.ms is browser-playable, so an MP3 is archived just for the link.
+  const env = makeEnv({ MMS_MEDIA_FORMATS: "3gp,mp4" });
+  const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (call) =>
+    call.get("method") === "sendMMS"
+      ? new Response(JSON.stringify({ status: "invalid_media" }), { status: 200 })
+      : okSms());
+
+  assert.equal(calls.length, 3, "two AMR candidates, then SMS — the MP3 is never offered");
+  assert.deepEqual(calls.slice(0, 2).map((c) => c.get("media1").split(".").pop()), ["3gp", "mp4"]);
+
+  const [, link] = calls[2].get("message").match(/Listen: (\S+)$/) || [];
+  assert.ok(link);
+  const page = await worker.fetch(new Request(link), env);
+  const [, audioSrc] = (await page.text()).match(/<audio[^>]*src="([^"]+)"/) || [];
+  const audio = await worker.fetch(new Request(audioSrc), env);
+  assert.ok(isMp3(new Uint8Array(await audio.arrayBuffer())), "link should serve the MP3 rendition");
+});
+
 test("walks 3gp then mp4 then wav as VoIP.ms refuses each", async () => {
   const env = makeEnv();
   const calls = await runEmail(env, buildVoicemailEmail(buildWav(2)), (call) =>
@@ -341,8 +361,13 @@ test("falls back to SMS with a listening link when VoIP.ms rejects the MMS", asy
   assert.match(html, /914-555-0100/, "the player page names the caller");
   const [, audioSrc] = html.match(/<audio[^>]*src="([^"]+)"/) || [];
   assert.ok(audioSrc, "player page should embed an audio element");
+  // No browser decodes AMR, so the link must never point at the 3GP or MP4
+  // rendition even though those lead the MMS order.
   const audio = await worker.fetch(new Request(audioSrc), env);
-  assert.ok(is3gp(new Uint8Array(await audio.arrayBuffer())));
+  const played = new Uint8Array(await audio.arrayBuffer());
+  assert.ok(!is3gp(played), "a listening link to AMR opens a player stuck at 0:00");
+  assert.ok(isRiffWave(played) || isMp3(played), "the link must serve audio a browser can play");
+  assert.match(audio.headers.get("content-type"), /^audio\/(wav|mpeg)$/);
 });
 
 test("uploads the recording even with no public media URL configured", async () => {
