@@ -192,8 +192,12 @@ test("transcodes an 8 kHz WAV voicemail into a decodable MP3", () => {
   assert.ok(Math.abs(mp3.durationSeconds - 3) < 0.2, `unexpected duration ${mp3.durationSeconds}`);
 });
 
-test("defaults to WAV only, since an accepted MP3 is silently dropped in transit", () => {
-  assert.deepEqual(parseMmsFormats(""), ["wav"]);
+test("defaults to 3GP then MP4 then WAV, leaving out the format that vanishes", () => {
+  // AMR-in-3GP first (the codec MMS was built around), the same bytes under
+  // the other whitelisted extension, then WAV — which is refused honestly and
+  // so still produces the SMS link. MP3 reports success and delivers nothing.
+  assert.deepEqual(parseMmsFormats(""), ["3gp", "mp4", "wav"]);
+  assert.ok(!parseMmsFormats("").includes("mp3"));
 });
 
 test("offers WAV before MP3 when both are requested", () => {
@@ -217,7 +221,7 @@ test("offers WAV before MP3 when both are requested", () => {
 test("honours a configured format order", () => {
   assert.deepEqual(parseMmsFormats("mp3,wav"), ["mp3", "wav"]);
   assert.deepEqual(parseMmsFormats("MP3"), ["mp3"]);
-  assert.deepEqual(parseMmsFormats("ogg,flac"), ["wav"], "unknown formats fall back to the default");
+  assert.deepEqual(parseMmsFormats("ogg,flac"), ["3gp", "mp4", "wav"], "unknown formats fall back to the default");
 
   const { candidates } = buildMmsCandidates(buildWav(tone(1)), parseMmsFormats("mp3"));
   assert.deepEqual(candidates.map((c) => c.format), ["mp3"]);

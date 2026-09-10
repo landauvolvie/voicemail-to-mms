@@ -44,14 +44,30 @@ So Ogg is ruled out at the door and is not worth encoding. Only these matter, an
 | `mp3` | `sendMMS` accepts it; the carrier drops it before it reaches the handset. |
 | `wav` | The portal sends it and it plays; `sendMMS` refuses it as `invalid_media`. |
 | `midi` | Cannot carry a recording. |
-| `mp4`, `3gp` | **Untested.** The only permitted containers not yet tried. |
+| `mp4`, `3gp` | AMR-NB, the format the Worker now sends first. |
 
 Note that the two checks are not the same code. The portal rejects on **file extension** — it accepts `.wav` and never looks further. The `sendMMS` media fetch rejects on **file content**: WAV bytes published under an `.mp3` name and served as `audio/mpeg` are refused, while real MP3 at that identical URL is accepted. That difference is why the portal sends a file the API will not.
 
+**AMR-NB in a 3GP container is offered first.** `3gp` and `mp4` are both on the whitelist above, AMR-NB is the codec MMS was specified around, and it is compact: a 60-second voicemail is 96 KB as 3GP against 960 KB as WAV. The same bytes are offered under both extensions, because the whitelist is checked by extension and the two entries can behave differently. WAV comes last — it is refused honestly, and that refusal is what produces the SMS link.
+
+MP3 stays out of the default deliberately. The API accepts it and the carrier drops it, so it reports success, suppresses the SMS fallback, and delivers nothing.
+
 Two knobs control the attempt order, and the Worker tries every format over every transport before giving up:
 
-- `MMS_MEDIA_FORMATS` - `wav` (default), `mp3`, `wav,mp3`, `mp3,wav`
+- `MMS_MEDIA_FORMATS` - `3gp,mp4,wav` (default), plus `mp3` in any order
 - `MMS_TRANSPORTS` - `get_url` (default), plus `multipart_file`, `multipart_url` and `post_url`
+
+### Encoding AMR in a Worker
+
+The Workers runtime refuses runtime WebAssembly compilation outright:
+
+```
+WebAssembly.instantiate(): Wasm code generation disallowed by embedder
+```
+
+That rules out every emscripten encoder that compiles from an `ArrayBuffer`. `vendor/amrnb.cjs` sidesteps it by being an **asm.js** build of opencore-amrnb — plain JavaScript, so the ban does not apply. One line is prepended to the upstream file, shadowing `process` and `require` inside the module: emscripten's environment probe otherwise sees the Workers `process` global plus the bundler's `require` shim, takes its Node path, and dies on `Dynamic require of "fs" is not supported` at module load.
+
+`src/mp4.js` writes the ISO base media container by hand — `ftyp`/`moov`/`mdat` with a `samr` sample entry and its `damr` decoder config. `test/mp4.test.js` walks the box tree of a real output file and checks that the sample table agrees with the audio, including that `stco` points exactly at the first byte of `mdat`, and decodes the frames back through the AMR decoder to confirm nothing is dropped.
 
 `mms_success` names the winning format and transport; each refusal is logged as `mms_candidate_rejected` with the API's own reason.
 
@@ -59,11 +75,13 @@ Two knobs control the attempt order, and the Worker tries every format over ever
 
 `GET /diagnostics/media-probe?key=<PROBE_KEY or RECORDING_LINK_SECRET>` sends one short test MMS per format/transport pair and reports which ones `sendMMS` accepts, so the API's verdict on a whole set is known in one request instead of one voicemail at a time.
 
-It defaults to the one question still open: whether the URL validator that refuses `.wav` keys on the extension rather than the content. The `wav-as-mp3` variants publish WAV bytes under an `.mp3` name, one labelled `audio/mpeg` and one `audio/wav`, alongside a plain `.wav` control. Widen it with `&variants=` (`wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`), narrow it with `&transports=`, and set clip length with `&seconds=`.
+It defaults to `3gp-amr,mp4-amr` — the AMR audio the Worker now sends, under both permitted extensions — so a single request answers whether `sendMMS` takes it. Select others with `&variants=` (`wav-as-mp3`, `wav-as-mp3-wavtype`, `wav-8k-pcm16`, `wav-16k-pcm16`, `wav-22k-pcm16`, `wav-44k-pcm16`, `wav-44k-stereo`, `wav-8k-mulaw`, `mp3-16k`), narrow transports with `&transports=`, and set clip length with `&seconds=`.
+
+The `wav-as-mp3` pair settled an earlier question: WAV bytes published under an `.mp3` name were refused with `invalid_media` under both `audio/mpeg` and `audio/wav`, while real MP3 at that same URL shape is accepted — which is how we know the media check reads file content.
 
 These are real, billable messages to `MMS_DESTINATION`, so the endpoint 404s without the key and never runs on its own. Anything the API accepts still has to survive the carrier — check which numbered probes actually arrive.
 
-WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
+3GP and MP4 are AMR-NB mono at 12.2 kbps (mode MR122), resampled to the codec's 8 kHz. WAV is re-encoded to canonical mono 16-bit PCM at the recorded sample rate. MP3 is mono at 32 kbps, upsampled to 16 kHz so it is MPEG-2 Layer III rather than the less widely supported MPEG-2.5. Because 8 kHz PCM runs 16 KB per second, the WAV candidate is dropped for recordings past roughly 43 seconds and MP3 ships alone.
 
 ## Required Cloudflare variables/secrets
 
@@ -88,7 +106,7 @@ No credentials or phone numbers are committed to GitHub.
 | `TIME_ZONE` | Notification time zone. Defaults to `America/New_York`. |
 | `CONTACTS_JSON` | Optional JSON phone-to-name map, e.g. `{"8455551212":"John Smith"}`. A matching contact name overrides Caller ID name from the voicemail email. |
 | `ALLOWED_SENDER_DOMAINS` | Comma-separated sender domains. Defaults to `voip.ms,voipinterface.net`. |
-| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `wav`. |
+| `MMS_MEDIA_FORMATS` | Ordered media formats to offer VoIP.ms. Defaults to `3gp,mp4,wav`. |
 | `MMS_TRANSPORTS` | Ordered `sendMMS` transports. Defaults to `get_url`, the only one that reports failure honestly. |
 | `PROBE_KEY` | Key for `/diagnostics/media-probe`. Falls back to `RECORDING_LINK_SECRET`; the probe is disabled when neither is set. |
 
@@ -153,5 +171,6 @@ Cloudflare's Git integration deploys this Worker automatically on every push to 
 Tests cover three layers:
 
 - `test/core.test.js` - NANP normalization, caller-ID extraction, sender-domain validation, contact-name overrides.
+- `test/mp4.test.js` - AMR frame sizes and TOC bytes, the 3GP box tree and sample table, and a decoder round-trip.
 - `test/audio.test.js` - WAV parsing (PCM, A-law, mu-law, stereo, bad chunk sizes), candidate ordering and size limits, and MP3 output verified by walking real MP3 frame headers for sample rate, version and duration.
 - `test/worker.test.js` - the whole email handler against a stubbed VoIP.ms API and an in-memory R2, asserting that `media1` is a fetchable URL rather than inline data, that a WAV rejection falls through to the MP3 candidate, that recording URLs serve the right content type and length over GET and HEAD, and that every SMS fallback fits one segment with its link intact.

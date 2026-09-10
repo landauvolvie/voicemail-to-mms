@@ -620,9 +620,7 @@ async function runMediaProbe(request, env) {
   const url = new URL(request.url);
   // The format question is settled — the recording plays once it arrives — so
   // the probe defaults to one WAV across every transport instead.
-  const variants = parseProbeVariants(
-    url.searchParams.get("variants") || "wav-as-mp3,wav-as-mp3-wavtype,wav-8k-pcm16",
-  );
+  const variants = parseProbeVariants(url.searchParams.get("variants") || "3gp-amr,mp4-amr");
   const transports = parseProbeTransports(url.searchParams.get("transports") || "get_url");
   const seconds = clampInt(url.searchParams.get("seconds"), 1, 10, 2);
   const results = [];

@@ -1,3 +1,5 @@
+import { encodeAmrFrames } from "./amr.js";
+import { muxAmrToIsoBmff } from "./mp4.js";
 import {
   MP3_BITRATE_KBPS,
   MP3_MIME_TYPE,
@@ -18,6 +20,10 @@ import {
  * MMS, so the probe is behind a key and never runs on its own.
  */
 export const PROBE_VARIANTS = [
+  // AMR-NB in the two ISO containers VoIP.ms permits. Same audio, two names,
+  // because the whitelist is checked by extension.
+  "3gp-amr",
+  "mp4-amr",
   // `-as-mp3` variants are WAV bytes published under an .mp3 name. If the URL
   // validator that refuses .wav keys on the extension rather than the content,
   // these get past it, and what reaches the handset then depends on whether
@@ -58,6 +64,10 @@ export function buildProbeMedia(name, seconds = 2) {
   const at = (rate) => resamplePcm16(base, 8000, rate);
 
   switch (name) {
+    case "3gp-amr":
+      return muxAmrToIsoBmff(encodeAmrFrames(base), { brand: "3gp" });
+    case "mp4-amr":
+      return muxAmrToIsoBmff(encodeAmrFrames(base), { brand: "mp4" });
     case "wav-as-mp3":
       return { bytes: encodeWav(base, 8000), extension: "mp3", mimeType: MP3_MIME_TYPE };
     case "wav-as-mp3-wavtype":

@@ -1,4 +1,6 @@
 import lamejs from "@breezystack/lamejs";
+import { AMR_SAMPLE_RATE, encodeAmrFrames } from "./amr.js";
+import { muxAmrToIsoBmff } from "./mp4.js";
 
 // Two constraints pull in opposite directions and, so far, admit no overlap:
 //
@@ -10,10 +12,14 @@ import lamejs from "@breezystack/lamejs";
 //
 // So MP3 is accepted by the API and then vanishes, which is worse than a
 // refusal: sendMMS reports success, no fallback fires, and nothing arrives.
-// The default therefore offers WAV only — if VoIP.ms refuses it the Worker
-// falls back to an SMS carrying a link that actually plays. Add "mp3" to
-// `MMS_MEDIA_FORMATS` if the carrier ever starts accepting it.
-export const DEFAULT_MMS_FORMATS = ["wav"];
+//
+// AMR-NB in a 3GP container is tried first. Both `3gp` and `mp4` are on the
+// VoIP.ms whitelist, and AMR-NB is the codec MMS was specified around, so it
+// is the audio most likely to survive the carrier that drops MP3. The same
+// bytes are offered under both names because the whitelist is checked by file
+// extension, so the two entries can behave differently. WAV comes last: it is
+// refused honestly, which is what hands off to the SMS link.
+export const DEFAULT_MMS_FORMATS = ["3gp", "mp4", "wav"];
 export const MP3_BITRATE_KBPS = 32;
 export const MP3_MIME_TYPE = "audio/mpeg";
 export const WAV_MIME_TYPE = "audio/wav";
@@ -234,11 +240,13 @@ export function encodeWav(samples, sampleRate, channels = 1) {
   return out;
 }
 
+export const SUPPORTED_MMS_FORMATS = ["3gp", "mp4", "wav", "mp3"];
+
 export function parseMmsFormats(value) {
   const requested = String(value || "")
     .split(",")
     .map((item) => item.trim().toLowerCase())
-    .filter((item) => item === "wav" || item === "mp3");
+    .filter((item) => SUPPORTED_MMS_FORMATS.includes(item));
   return requested.length ? [...new Set(requested)] : DEFAULT_MMS_FORMATS;
 }
 
@@ -272,6 +280,11 @@ export function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
   const decoded = decodeWavToMonoPcm16(data);
   const durationSeconds = Math.round((decoded.samples.length / decoded.sampleRate) * 100) / 100;
   const candidates = [];
+  // 3gp and mp4 are the same audio under different names, so encode once.
+  let amrFrames = null;
+  const amr = () => (amrFrames ??= encodeAmrFrames(
+    resamplePcm16(decoded.samples, decoded.sampleRate, AMR_SAMPLE_RATE),
+  ));
 
   for (const format of formats) {
     if (format === "wav") {
@@ -286,6 +299,16 @@ export function buildMmsCandidates(bytes, formats = DEFAULT_MMS_FORMATS) {
         extension: "wav",
         transcoded: true,
         sampleRate: decoded.sampleRate,
+      });
+    } else if (format === "3gp" || format === "mp4") {
+      const muxed = muxAmrToIsoBmff(amr(), { brand: format });
+      candidates.push({
+        format,
+        bytes: muxed.bytes,
+        mimeType: muxed.mimeType,
+        extension: muxed.extension,
+        transcoded: true,
+        sampleRate: AMR_SAMPLE_RATE,
       });
     } else if (format === "mp3") {
       const sampleRate = chooseMp3SampleRate(decoded.sampleRate);
